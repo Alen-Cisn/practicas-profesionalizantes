@@ -83,6 +83,7 @@ class InternetArchiveClient:
     # URLs base de Internet Archive - enfoque en Wayback Machine
     CDX_API = "http://web.archive.org/cdx/search/cdx"
     WAYBACK_BASE = "http://web.archive.org/web/"
+    AVAILABILITY_API = "http://archive.org/wayback/available"
     
     # Dominios populares para búsqueda de páginas web
     POPULAR_DOMAINS = [
@@ -132,12 +133,15 @@ class InternetArchiveClient:
         logger.info(f"Iniciando búsqueda de páginas web con parámetros: {query_params}")
         
         documents = []
-        domains = query_params.get('domains', self.POPULAR_DOMAINS[:5])  # Usar algunos dominios por defecto
+        domains = query_params.get('domains', self.POPULAR_DOMAINS[:5])
         
-        # Buscar en cada dominio
+        # Buscar en cada dominio usando método robusto
         for domain in domains:
             try:
-                domain_documents = self._search_domain_pages(domain, query_params, max_results // len(domains))
+                # Intentar primero con búsqueda por años (más confiable)
+                logger.info(f"Buscando páginas en {domain} usando método por años...")
+                domain_documents = self._search_domain_by_years(domain, query_params, max_results // len(domains))
+                
                 documents.extend(domain_documents)
                 
                 logger.info(f"Dominio {domain}: {len(domain_documents)} páginas encontradas")
@@ -163,19 +167,21 @@ class InternetArchiveClient:
         start_year = query_params.get('start_year', 1995)
         end_year = query_params.get('end_year', 2005)
         
-        # Parámetros para CDX API
+        # Parámetros para CDX API - optimizados para mejor respuesta
         params = {
             'url': f'{domain}/*',
             'from': f'{start_year}0101',
             'to': f'{end_year}1231',
             'output': 'json',
-            'fl': 'timestamp,original,mimetype,statuscode,digest,length',
+            'fl': 'timestamp,original,mimetype,statuscode,digest',
             'filter': 'statuscode:200',
-            'collapse': 'digest',  # Evitar duplicados
-            'limit': max_per_domain
+            'filter': 'mimetype:text/html',
+            'collapse': 'urlkey',  # Mejor que digest para evitar duplicados
+            'limit': min(max_per_domain, 1000)  # Limitar requests grandes
         }
         
-        response = self._make_request(self.CDX_API, params)
+        # Usar timeout más largo para CDX API
+        response = self._make_request(self.CDX_API, params, timeout=60)
         if not response:
             return []
             
@@ -186,10 +192,12 @@ class InternetArchiveClient:
             # Saltar la primera línea (headers) si existe
             if data and isinstance(data[0], list) and data[0][0] == 'timestamp':
                 data = data[1:]
+            
+            logger.info(f"Recibidas {len(data)} entradas de CDX para {domain}")
                 
             for entry in data:
-                if len(entry) >= 6:
-                    timestamp, original_url, mimetype, statuscode, digest, length = entry[:6]
+                if len(entry) >= 5:  # Ahora son 5 campos en lugar de 6
+                    timestamp, original_url, mimetype, statuscode, digest = entry[:5]
                     
                     # Filtrar solo contenido HTML
                     if mimetype and ('text/html' in mimetype or 'html' in mimetype):
@@ -203,6 +211,110 @@ class InternetArchiveClient:
             logger.error(f"Error procesando respuesta CDX para {domain}: {e}")
             
         return documents
+    
+    def _search_domain_by_years(self, domain: str, query_params: Dict, max_per_domain: int) -> List[Document]:
+        """Búsqueda alternativa dividiendo por años individuales (más confiable)"""
+        logger.info(f"Búsqueda por años para {domain}")
+        
+        start_year = query_params.get('start_year', 1995)
+        end_year = query_params.get('end_year', 2005)
+        
+        all_documents = []
+        years = list(range(start_year, end_year + 1))
+        docs_per_year = max(5, max_per_domain // len(years))
+        
+        logger.info(f"Buscando en {len(years)} años, ~{docs_per_year} docs por año")
+        
+        for year in years:
+            try:
+                # Parámetros más simples y específicos
+                params = {
+                    'url': f'{domain}/*',
+                    'from': f'{year}0101',
+                    'to': f'{year}1231',
+                    'output': 'json',
+                    'fl': 'timestamp,original',  # Solo campos esenciales
+                    'limit': docs_per_year,
+                    'filter': 'statuscode:200'
+                }
+                
+                logger.debug(f"Buscando {domain} en {year}...")
+                response = self._make_request(self.CDX_API, params, timeout=30)
+                
+                if response:
+                    try:
+                        data = response.json()
+                        
+                        # Saltar header
+                        if data and len(data) > 0 and isinstance(data[0], list):
+                            if data[0][0] == 'timestamp':
+                                data = data[1:]
+                        
+                        logger.info(f"  {year}: {len(data)} páginas encontradas")
+                        
+                        for entry in data:
+                            if len(entry) >= 2:
+                                timestamp, original_url = entry[:2]
+                                
+                                # Validar que sea una URL válida
+                                if not original_url or len(original_url) < 10:
+                                    continue
+                                
+                                # Crear documento
+                                try:
+                                    date_obj = datetime.strptime(timestamp[:14], '%Y%m%d%H%M%S')
+                                    identifier = f"{domain}_{timestamp}_{len(all_documents)}"
+                                    
+                                    # Extraer título de URL
+                                    url_parts = original_url.rstrip('/').split('/')
+                                    title = url_parts[-1] if url_parts[-1] else url_parts[-2] if len(url_parts) > 1 else domain
+                                    if '?' in title:
+                                        title = title.split('?')[0]
+                                    if len(title) > 100:
+                                        title = title[:100]
+                                    
+                                    document = Document(identifier, title, date_obj, year)
+                                    document.metadata = {
+                                        'original_url': original_url,
+                                        'wayback_url': f"{self.WAYBACK_BASE}{timestamp}/{original_url}",
+                                        'mimetype': 'text/html',
+                                        'source_api': 'cdx_by_year',
+                                        'domain': domain
+                                    }
+                                    
+                                    # Validar documento
+                                    if self._validate_webpage(document, query_params):
+                                        all_documents.append(document)
+                                        
+                                except ValueError as e:
+                                    logger.debug(f"Error parseando timestamp {timestamp}: {e}")
+                                    continue
+                                except Exception as e:
+                                    logger.debug(f"Error creando documento: {e}")
+                                    continue
+                        
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Error parseando JSON para {year}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Error procesando respuesta para {year}: {e}")
+                else:
+                    logger.warning(f"  {year}: Sin respuesta del servidor")
+                
+                # Rate limiting entre años - más corto
+                time.sleep(self.rate_limit_delay * 0.3)
+                
+                # Si ya tenemos suficientes documentos, parar
+                if len(all_documents) >= max_per_domain:
+                    logger.info(f"Alcanzado límite de {max_per_domain} documentos para {domain}")
+                    break
+                    
+            except Exception as e:
+                logger.warning(f"Error buscando año {year} en {domain}: {e}")
+                continue
+        
+        logger.info(f"✅ Búsqueda completada para {domain}: {len(all_documents)} documentos encontrados")
+        return all_documents[:max_per_domain]
+    
     def _create_document_from_cdx_entry(self, timestamp: str, original_url: str, 
                                        mimetype: str, digest: str) -> Optional[Document]:
         """Crear objeto Document desde entrada CDX"""
@@ -536,22 +648,28 @@ class InternetArchiveClient:
                     url += '&' + urlencode(params)
                 else:
                     url += '?' + urlencode(params)
-                    
 
-            print(f"Realizando request a: {url}")
+            logger.debug(f"Realizando request a: {url}")
 
             response = self.session.get(url, timeout=timeout)
             
             # Manejar códigos de error específicos
             if response.status_code == 429:  # Too Many Requests
-                logger.warning("Rate limit exceeded, esperando...")
-                time.sleep(self.rate_limit_delay * 2)
+                logger.warning("Rate limit exceeded, esperando más tiempo...")
+                time.sleep(self.rate_limit_delay * 3)
                 return self._make_request(url, timeout=timeout)
                 
             elif response.status_code == 503:  # Service Unavailable
-                logger.warning("Servicio no disponible, reintentando...")
-                time.sleep(self.rate_limit_delay)
-                return self.session.get(url, timeout=timeout)
+                logger.warning("Servicio no disponible, esperando y reintentando...")
+                time.sleep(self.rate_limit_delay * 2)
+                # Un solo reintento para evitar bucles infinitos
+                try:
+                    response = self.session.get(url, timeout=timeout)
+                    if response.status_code == 200:
+                        return response
+                except:
+                    pass
+                return None
                 
             elif response.status_code != 200:
                 logger.warning(f"HTTP {response.status_code} para {url}")
@@ -561,13 +679,16 @@ class InternetArchiveClient:
             
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout para {url}")
+            self.failed_requests += 1
             return None
         except requests.exceptions.ConnectionError:
             logger.warning(f"Error de conexión para {url}")
+            self.failed_requests += 1
             time.sleep(self.rate_limit_delay)
             return None
         except Exception as e:
             logger.error(f"Error en request: {e}")
+            self.failed_requests += 1
             return None
             
     def _handle_rate_limiting(self):
@@ -972,25 +1093,28 @@ class HistoricalTermAnalyzer:
     Orquestador principal del sistema de análisis histórico de términos
     """
     
-    def __init__(self, rate_limit_delay: float = 1.0):
+    def __init__(self, rate_limit_delay: float = 1.0, progress_callback=None):
         """
         Inicializar analizador histórico
         
         Args:
             rate_limit_delay: Delay entre requests a Internet Archive
+            progress_callback: Función callback para reportar progreso (opcional)
         """
         self.client = InternetArchiveClient(rate_limit_delay)
         self.processor = TextProcessor()
         self.memory = SessionMemory()
         self.exporter = Exporter()
         self.visualizer = Visualizer()
+        self.progress_callback = progress_callback
         
     def analyze_period(self, 
                       start_year: int, 
                       end_year: int, 
                       max_documents: int = 600,
                       domains: Optional[List[str]] = None,
-                      search_terms: Optional[List[str]] = None) -> Dict:
+                      search_terms: Optional[List[str]] = None,
+                      analyze_by_year: bool = False) -> Dict:
         """
         Analizar términos en páginas web de un período histórico específico
         
@@ -1000,6 +1124,7 @@ class HistoricalTermAnalyzer:
             max_documents: Número máximo de páginas web a analizar
             domains: Lista de dominios a buscar (opcional, usa lista por defecto)
             search_terms: Términos específicos a buscar (opcional)
+            analyze_by_year: Si True, genera resultados separados por año
             
         Returns:
             Diccionario con resultados del análisis
@@ -1017,42 +1142,123 @@ class HistoricalTermAnalyzer:
         }
         
         try:
-            # Fase 1: Búsqueda de documentos
-            logger.info("Fase 1: Búsqueda de documentos...")
-            documents = self.client.search_items(query_params, max_documents)
+            # Paso 1: Búsqueda de documentos (10% del progreso)
+            if self.progress_callback:
+                self.progress_callback(5, "Buscando páginas web en Internet Archive...")
+            
+            documents = self.client.search_items(query_params, max_results=max_documents)
             
             if not documents:
-                logger.error("No se encontraron documentos")
-                return {'error': 'No se encontraron documentos'}
-                
+                return {'error': 'No se encontraron páginas web para los criterios especificados'}
+            
+            if self.progress_callback:
+                self.progress_callback(10, f"Encontradas {len(documents)} páginas web")
+            
             self.memory.add_documents(documents)
             
-            # Fase 2: Descarga de contenido
-            logger.info("Fase 2: Descarga de contenido textual...")
+            # Paso 2: Descarga de contenido (10% - 70% del progreso)
+            if self.progress_callback:
+                self.progress_callback(15, "Iniciando descarga de contenido...")
+            
             self._download_document_content(documents)
             
-            # Fase 3: Análisis de frecuencias
-            logger.info("Fase 3: Análisis de frecuencias...")
-            frequencies = self.processor.calculate_frequencies(documents)
-            self.memory.set_frequencies(frequencies)
+            # Filtrar documentos con contenido
+            docs_with_content = [d for d in documents if d.text_content]
             
-            # Fase 4: Obtener términos principales
-            top_terms = self.processor.get_top_terms(frequencies, top_n=100)
+            if not docs_with_content:
+                return {'error': 'No se pudo extraer contenido de ninguna página web'}
+            
+            if self.progress_callback:
+                self.progress_callback(75, f"{len(docs_with_content)} páginas con contenido válido")
+            
+            # Paso 3: Procesamiento de términos (70% - 90% del progreso)
+            if self.progress_callback:
+                self.progress_callback(80, "Procesando y contando términos...")
+            
+            # Análisis agregado
+            frequencies = self.processor.calculate_frequencies(docs_with_content)
+            top_terms = self.processor.get_top_terms(frequencies, top_n=50)
+            
+            self.memory.set_frequencies(frequencies)
             self.memory.set_top_terms(top_terms)
             
-            # Actualizar estadísticas
-            client_stats = self.client.get_stats()
-            self.memory.update_stats(client_stats)
+            # Análisis por año si se solicita
+            results_by_year = {}
+            if analyze_by_year:
+                if self.progress_callback:
+                    self.progress_callback(85, "Generando análisis por año...")
+                results_by_year = self._analyze_by_year(docs_with_content)
             
-            # Generar resultados
+            # Paso 4: Generar estadísticas (90% - 95% del progreso)
+            if self.progress_callback:
+                self.progress_callback(90, "Generando estadísticas...")
+            
+            client_stats = self.client.get_stats()
+            processor_stats = self.processor.get_cache_stats() if hasattr(self.processor, 'get_cache_stats') else {}
+            
+            self.memory.update_stats({
+                'client_stats': client_stats,
+                'processor_stats': processor_stats
+            })
+            
+            # Paso 5: Generar resultados finales (95% - 100%)
+            if self.progress_callback:
+                self.progress_callback(95, "Finalizando análisis...")
+            
             results = self._generate_results()
+            
+            # Agregar resultados por año si se generaron
+            if results_by_year:
+                results['results_by_year'] = results_by_year
+            
+            if self.progress_callback:
+                self.progress_callback(100, "¡Análisis completado!")
             
             logger.info("Análisis completado exitosamente")
             return results
             
         except Exception as e:
-            logger.error(f"Error en análisis: {e}")
-            return {'error': str(e)}
+            error_msg = f"Error durante el análisis: {str(e)}"
+            logger.error(error_msg)
+            if self.progress_callback:
+                self.progress_callback(0, f"Error: {str(e)}")
+            return {'error': error_msg}
+    
+    def _analyze_by_year(self, documents: List[Document]) -> Dict:
+        """
+        Analizar términos separadamente para cada año
+        
+        Args:
+            documents: Lista de documentos con contenido
+            
+        Returns:
+            Diccionario con resultados por año {año: {frequencies, top_terms}}
+        """
+        results_by_year = {}
+        
+        # Agrupar documentos por año
+        docs_by_year = defaultdict(list)
+        for doc in documents:
+            if doc.year:
+                docs_by_year[doc.year].append(doc)
+        
+        # Analizar cada año
+        for year in sorted(docs_by_year.keys()):
+            year_docs = docs_by_year[year]
+            
+            # Calcular frecuencias para este año
+            frequencies = self.processor.calculate_frequencies(year_docs)
+            top_terms = self.processor.get_top_terms(frequencies, top_n=50)
+            
+            results_by_year[year] = {
+                'frequencies': frequencies,
+                'top_terms': top_terms,
+                'document_count': len(year_docs)
+            }
+            
+            logger.info(f"Año {year}: {len(year_docs)} documentos, {len(frequencies)} términos únicos")
+        
+        return results_by_year
             
     def _download_document_content(self, documents: List[Document]):
         """Descargar contenido textual para todas las páginas web con paralelización optimizada"""
@@ -1065,6 +1271,10 @@ class HistoricalTermAnalyzer:
         # Usar paralelización para downloads de red
         max_workers = min(8, total_docs)  # Máximo 8 workers para evitar sobrecargar el servidor
         
+        # Variables para tracking de progreso
+        completed_docs = 0
+        progress_step = max(1, total_docs // 60)  # Actualizar progreso cada ~1.6% (60 pasos entre 15% y 75%)
+        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Enviar todas las tareas de descarga
             future_to_doc = {
@@ -1072,25 +1282,30 @@ class HistoricalTermAnalyzer:
                 for doc in documents
             }
             
-            # Procesar resultados conforme se completan
-            for i, future in enumerate(as_completed(future_to_doc), 1):
+            # Procesar resultados a medida que se completan
+            for future in as_completed(future_to_doc):
                 doc = future_to_doc[future]
+                completed_docs += 1
                 
                 try:
-                    success = future.result(timeout=60)  # Timeout de 60 segundos por documento
+                    success = future.result()
                     if success:
                         successful_downloads += 1
-                        logger.debug(f"Contenido descargado: {doc.identifier}")
-                    else:
-                        logger.warning(f"No se pudo obtener contenido para {doc.identifier}")
+                        
+                    # Reportar progreso (15% - 75% del rango total)
+                    if self.progress_callback and completed_docs % progress_step == 0:
+                        progress_percent = 15 + int((completed_docs / total_docs) * 60)
+                        self.progress_callback(
+                            progress_percent, 
+                            f"Descargando: {completed_docs}/{total_docs} páginas ({successful_downloads} exitosas)"
+                        )
                         
                 except Exception as e:
-                    logger.error(f"Error descargando {doc.identifier}: {e}")
-                    continue
-                
-                # Log de progreso cada 10 documentos
-                if i % 10 == 0:
-                    logger.info(f"Progreso: {i}/{total_docs} páginas procesadas")
+                    logger.error(f"Error procesando resultado de descarga: {e}")
+        
+        # Reporte final de descarga
+        if self.progress_callback:
+            self.progress_callback(75, f"Descarga completada: {successful_downloads}/{total_docs} páginas exitosas")
                     
         logger.info(f"Descarga paralela completada: {successful_downloads}/{total_docs} exitosos")
     

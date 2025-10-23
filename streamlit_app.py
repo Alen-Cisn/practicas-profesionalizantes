@@ -73,8 +73,16 @@ def initialize_session_state():
         st.session_state.analysis_running = False
     if 'analysis_progress' not in st.session_state:
         st.session_state.analysis_progress = 0
+    if 'analysis_status' not in st.session_state:
+        st.session_state.analysis_status = ""
     if 'analysis_log' not in st.session_state:
         st.session_state.analysis_log = []
+    if 'analysis_history' not in st.session_state:
+        st.session_state.analysis_history = []
+    if 'selected_analysis_id' not in st.session_state:
+        st.session_state.selected_analysis_id = None
+    if 'cancel_requested' not in st.session_state:
+        st.session_state.cancel_requested = False
 
 def add_log_entry(message: str, level: str = "info"):
     """Agregar entrada al log de análisis"""
@@ -95,6 +103,48 @@ def display_log():
             for entry in reversed(st.session_state.analysis_log[-10:]):  # Últimas 10 entradas
                 level_icon = {"info": "ℹ️", "warning": "⚠️", "error": "❌", "success": "✅"}.get(entry['level'], "ℹ️")
                 st.text(f"{entry['timestamp']} {level_icon} {entry['message']}")
+
+def add_to_history(results):
+    """Agregar resultados al historial"""
+    if results and 'error' not in results:
+        # Crear ID único para este análisis
+        analysis_id = f"analysis_{len(st.session_state.analysis_history) + 1}"
+        
+        config = results.get('config', {})
+        
+        # Crear entrada de historial
+        history_entry = {
+            'id': analysis_id,
+            'timestamp': datetime.now(),
+            'config': config,
+            'results': results,
+            'summary': results.get('summary', {}),
+            'label': f"{config.get('start_year', '?')}-{config.get('end_year', '?')} ({config.get('max_documents', '?')} docs)"
+        }
+        
+        # Agregar al historial (mantener máximo 10 análisis)
+        st.session_state.analysis_history.append(history_entry)
+        if len(st.session_state.analysis_history) > 10:
+            st.session_state.analysis_history.pop(0)
+        
+        # Seleccionar automáticamente el nuevo análisis
+        st.session_state.selected_analysis_id = analysis_id
+        
+        return analysis_id
+    return None
+
+def get_selected_results():
+    """Obtener resultados del análisis seleccionado"""
+    if st.session_state.selected_analysis_id:
+        for entry in st.session_state.analysis_history:
+            if entry['id'] == st.session_state.selected_analysis_id:
+                return entry['results']
+    
+    # Si no hay selección o no se encuentra, usar el último
+    if st.session_state.analysis_history:
+        return st.session_state.analysis_history[-1]['results']
+    
+    return st.session_state.analysis_results
 
 def create_sidebar():
     """Crear sidebar con configuraciones"""
@@ -195,10 +245,20 @@ def create_sidebar():
 
 def run_analysis(config):
     """Ejecutar análisis con la configuración dada"""
+    
+    # Callback para reportar progreso
+    def progress_callback(percent, message):
+        st.session_state.analysis_progress = percent
+        st.session_state.analysis_status = message
+        add_log_entry(message, "info")
+    
     try:
-        # Inicializar analizador
+        # Inicializar analizador con callback
         add_log_entry("Inicializando analizador...", "info")
-        analyzer = HistoricalTermAnalyzer(rate_limit_delay=config['rate_limit'])
+        analyzer = HistoricalTermAnalyzer(
+            rate_limit_delay=config['rate_limit'],
+            progress_callback=progress_callback
+        )
         
         # Configurar procesamiento paralelo
         analyzer.processor.use_parallel = config['use_parallel']
@@ -207,12 +267,13 @@ def run_analysis(config):
         add_log_entry(f"Dominios: {', '.join(config['domains'])}", "info")
         add_log_entry(f"Máximo de páginas: {config['max_documents']}", "info")
         
-        # Ejecutar análisis
+        # Ejecutar análisis con análisis por año habilitado
         results = analyzer.analyze_period(
             start_year=config['start_year'],
             end_year=config['end_year'],
             max_documents=config['max_documents'],
-            domains=config['domains']
+            domains=config['domains'],
+            analyze_by_year=True  # Siempre generar resultados por año
         )
         
         if 'error' in results:
@@ -225,6 +286,15 @@ def run_analysis(config):
         if hasattr(analyzer.processor, 'get_cache_stats'):
             cache_stats = analyzer.processor.get_cache_stats()
             add_log_entry(f"Cache hit rate: {cache_stats['hit_rate_percent']}%", "info")
+        
+        # Agregar metadatos de configuración a los resultados
+        results['config'] = {
+            'start_year': config['start_year'],
+            'end_year': config['end_year'],
+            'max_documents': config['max_documents'],
+            'domains': config['domains'],
+            'timestamp': datetime.now().isoformat()
+        }
         
         return results
         
@@ -239,6 +309,39 @@ def display_results(results):
         
     st.markdown("---")
     st.markdown('<h2 class="main-header">📊 Resultados del Análisis</h2>', unsafe_allow_html=True)
+    
+    # Selector de historial si hay múltiples análisis
+    if len(st.session_state.analysis_history) > 1:
+        st.subheader("🗂️ Historial de Análisis")
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            # Crear opciones para el selector
+            history_options = {
+                entry['id']: f"{entry['timestamp'].strftime('%Y-%m-%d %H:%M')} - {entry['label']}"
+                for entry in st.session_state.analysis_history
+            }
+            
+            selected_id = st.selectbox(
+                "Seleccionar análisis",
+                options=list(history_options.keys()),
+                format_func=lambda x: history_options[x],
+                index=len(history_options) - 1 if st.session_state.selected_analysis_id is None 
+                      else list(history_options.keys()).index(st.session_state.selected_analysis_id),
+                key="history_selector"
+            )
+            
+            if selected_id != st.session_state.selected_analysis_id:
+                st.session_state.selected_analysis_id = selected_id
+                st.rerun()
+        
+        with col2:
+            if st.button("🗑️ Limpiar Historial"):
+                st.session_state.analysis_history = []
+                st.session_state.selected_analysis_id = None
+                st.session_state.analysis_results = None
+                st.rerun()
     
     # Métricas principales
     summary = results.get('summary', {})
@@ -276,30 +379,139 @@ def display_results(results):
         st.metric("📈 Tasa de Éxito", f"{success_rate:.1f}%")
     
     # Tabs para diferentes visualizaciones
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Top Términos", "📈 Distribución", "📋 Datos Detallados", "📁 Exportar"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Resultados Agregados", 
+        "📅 Resultados por Año",
+        "📈 Distribución", 
+        "📋 Datos Detallados", 
+        "📁 Exportar"
+    ])
     
     with tab1:
-        display_top_terms(results)
+        display_aggregated_results(results)
     
     with tab2:
-        display_frequency_distribution(results)
+        display_yearly_results(results)
     
     with tab3:
-        display_detailed_data(results)
+        display_frequency_distribution(results)
     
     with tab4:
+        display_detailed_data(results)
+    
+    with tab5:
         display_export_options(results)
 
-def display_top_terms(results):
-    """Mostrar términos más frecuentes"""
-    top_terms = results.get('top_terms', [])
+def display_aggregated_results(results):
+    """Mostrar resultados agregados de todos los años"""
+    st.subheader("📊 Top Términos - Todos los Años")
+    display_top_terms_chart(results.get('top_terms', []), "Agregado")
+
+def display_yearly_results(results):
+    """Mostrar resultados separados por año"""
+    results_by_year = results.get('results_by_year', {})
+    
+    if not results_by_year:
+        st.warning("No hay resultados por año disponibles. El análisis puede no haber generado datos separados por año.")
+        return
+    
+    st.subheader("📅 Análisis por Año Individual")
+    
+    # Selector de año
+    years = sorted(results_by_year.keys())
+    
+    if not years:
+        st.info("No hay años disponibles para mostrar")
+        return
+    
+    # Crear tabs para cada año
+    year_tabs = st.tabs([f"{year}" for year in years])
+    
+    for i, year in enumerate(years):
+        with year_tabs[i]:
+            year_data = results_by_year[year]
+            
+            # Métricas del año
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("📄 Documentos", year_data.get('document_count', 0))
+            
+            with col2:
+                st.metric("🔤 Términos Únicos", len(year_data.get('frequencies', {})))
+            
+            with col3:
+                top_term = year_data.get('top_terms', [('N/A', 0)])[0]
+                st.metric("🏆 Término Top", f"{top_term[0]} ({top_term[1]})")
+            
+            # Gráfico de términos
+            st.subheader(f"Top Términos en {year}")
+            display_top_terms_chart(year_data.get('top_terms', []), f"Año {year}")
+            
+            # Comparación con otros años (opcional)
+            if len(years) > 1:
+                st.subheader(f"Comparación de {year} con otros años")
+                display_year_comparison(results_by_year, year)
+
+def display_year_comparison(results_by_year, current_year):
+    """Mostrar comparación de términos entre años"""
+    # Obtener top 10 términos del año actual
+    current_top = results_by_year[current_year].get('top_terms', [])[:10]
+    
+    if not current_top:
+        return
+    
+    # Crear DataFrame para comparación
+    comparison_data = []
+    
+    for term, freq in current_top:
+        row = {'Término': term, str(current_year): freq}
+        
+        # Buscar el término en otros años
+        for year in sorted(results_by_year.keys()):
+            if year != current_year:
+                year_freqs = results_by_year[year].get('frequencies', {})
+                row[str(year)] = year_freqs.get(term, 0)
+        
+        comparison_data.append(row)
+    
+    df_comparison = pd.DataFrame(comparison_data)
+    
+    # Gráfico de barras agrupadas
+    fig = go.Figure()
+    
+    for year in sorted(results_by_year.keys()):
+        fig.add_trace(go.Bar(
+            name=str(year),
+            x=df_comparison['Término'],
+            y=df_comparison[str(year)],
+        ))
+    
+    fig.update_layout(
+        barmode='group',
+        title=f"Frecuencia de Top Términos de {current_year} en Todos los Años",
+        xaxis_title="Término",
+        yaxis_title="Frecuencia",
+        height=500
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+def display_top_terms_chart(top_terms, label=""):
+    """Mostrar gráfico de términos más frecuentes"""
     
     if not top_terms:
         st.warning("No se encontraron términos para mostrar")
         return
     
     # Slider para seleccionar número de términos a mostrar
-    num_terms = st.slider("Número de términos a mostrar", 10, min(50, len(top_terms)), 20)
+    num_terms = st.slider(
+        f"Número de términos a mostrar - {label}", 
+        10, 
+        min(50, len(top_terms)), 
+        20,
+        key=f"slider_{label}"
+    )
     
     # Crear DataFrame
     df_terms = pd.DataFrame(top_terms[:num_terms], columns=['Término', 'Frecuencia'])
@@ -310,7 +522,7 @@ def display_top_terms(results):
         x='Frecuencia',
         y='Término',
         orientation='h',
-        title=f"Top {num_terms} Términos Más Frecuentes",
+        title=f"Top {num_terms} Términos Más Frecuentes - {label}",
         color='Frecuencia',
         color_continuous_scale='viridis'
     )
@@ -323,8 +535,12 @@ def display_top_terms(results):
     st.plotly_chart(fig, use_container_width=True)
     
     # Tabla de términos
-    st.subheader("📋 Tabla de Términos")
+    st.subheader(f"📋 Tabla de Términos - {label}")
     st.dataframe(df_terms, use_container_width=True)
+
+def display_top_terms(results):
+    """Mostrar términos más frecuentes - función legacy, redirige a la nueva"""
+    display_top_terms_chart(results.get('top_terms', []), "Todos los años")
 
 def display_frequency_distribution(results):
     """Mostrar distribución de frecuencias"""
@@ -503,44 +719,97 @@ def main():
     with col1:
         st.subheader("🚀 Iniciar Análisis")
         
-        if st.button("▶️ Ejecutar Análisis", type="primary", disabled=st.session_state.analysis_running):
-            st.session_state.analysis_running = True
-            st.session_state.analysis_log = []
+        # Mostrar contenido según el estado
+        if not st.session_state.analysis_running:
+            # Mostrar botón solo cuando NO está ejecutando
+            if st.button("▶️ Ejecutar Análisis", type="primary", key="run_button"):
+                st.session_state.analysis_running = True
+                st.session_state.analysis_log = []
+                st.session_state.analysis_progress = 0
+                st.session_state.analysis_status = "Iniciando..."
+                st.rerun()
+        else:
+            # Ejecutando análisis - NO mostrar botón
+            st.info("⏳ Análisis en progreso... Por favor espera.")
             
-            # Contenedor para el progreso
-            progress_container = st.container()
+            # Botón de cancelar
+            col_cancel1, col_cancel2 = st.columns([1, 4])
+            with col_cancel1:
+                if st.button("⏹️ Cancelar", type="secondary", key="cancel_button"):
+                    st.session_state.cancel_requested = True
+                    add_log_entry("Cancelación solicitada por el usuario", "warning")
             
-            with progress_container:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+            # Crear placeholders para actualización en tiempo real
+            progress_bar = st.progress(0)
+            progress_text = st.empty()
+            status_placeholder = st.empty()
+            
+            # Callback para actualizar UI en tiempo real
+            def update_progress(percent, message):
+                # Verificar si se solicitó cancelación
+                if st.session_state.cancel_requested:
+                    raise InterruptedError("Análisis cancelado por el usuario")
                 
-                status_text.text("Iniciando análisis...")
-                progress_bar.progress(10)
+                st.session_state.analysis_progress = percent
+                st.session_state.analysis_status = message
+                add_log_entry(message, "info")
+                progress_bar.progress(percent / 100.0)
+                progress_text.text(f"{percent}% - {message}")
+            
+            # Ejecutar análisis con callback personalizado
+            try:
+                analyzer = HistoricalTermAnalyzer(
+                    rate_limit_delay=config['rate_limit'],
+                    progress_callback=update_progress
+                )
                 
-                # Ejecutar análisis
-                results = run_analysis(config)
+                analyzer.processor.use_parallel = config['use_parallel']
                 
-                progress_bar.progress(100)
-                status_text.text("¡Análisis completado!")
+                results = analyzer.analyze_period(
+                    start_year=config['start_year'],
+                    end_year=config['end_year'],
+                    max_documents=config['max_documents'],
+                    domains=config['domains'],
+                    analyze_by_year=True
+                )
                 
-                if results:
+                if results and 'error' not in results:
+                    results['config'] = {
+                        'start_year': config['start_year'],
+                        'end_year': config['end_year'],
+                        'max_documents': config['max_documents'],
+                        'domains': config['domains'],
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
                     st.session_state.analysis_results = results
-                    st.success("✅ Análisis completado exitosamente")
+                    add_to_history(results)
+                    status_placeholder.success("✅ Análisis completado exitosamente")
                 else:
-                    st.error("❌ Error durante el análisis. Revisa el log para más detalles.")
+                    error_msg = results.get('error', 'Error desconocido') if results else 'Error desconocido'
+                    status_placeholder.error(f"❌ Error durante el análisis: {error_msg}")
                 
+            except InterruptedError as e:
+                status_placeholder.warning(f"⚠️ {str(e)}")
+                add_log_entry(f"Análisis cancelado: {str(e)}", "warning")
+                
+            except Exception as e:
+                status_placeholder.error(f"❌ Error inesperado: {str(e)}")
+                add_log_entry(f"Error: {str(e)}", "error")
+            
+            finally:
                 st.session_state.analysis_running = False
-                
-                # Rerun para mostrar resultados
-                time.sleep(1)
+                st.session_state.cancel_requested = False
+                time.sleep(2)
                 st.rerun()
     
     with col2:
         display_log()
     
     # Mostrar resultados si están disponibles
-    if st.session_state.analysis_results:
-        display_results(st.session_state.analysis_results)
+    results_to_display = get_selected_results()
+    if results_to_display:
+        display_results(results_to_display)
 
 if __name__ == "__main__":
     main()
