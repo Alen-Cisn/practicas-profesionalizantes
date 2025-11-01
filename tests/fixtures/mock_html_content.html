@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mock Web Page for E2E Testing</title>
+</head>
+<body>
+    <header>
+        <h1>Sample Article Title</h1>
+        <p class="metadata">Published on January 1, 2020 by Test Author</p>
+    </header>
+    
+    <main>
+        <article>
+            <h2>Introduction to Climate Change</h2>
+            <p>
+                Climate change refers to long-term shifts in global temperatures and weather patterns.
+                While climate change is a natural phenomenon, scientific evidence shows that human activities
+                have been the dominant cause of warming since the mid-20th century.
+            </p>
+            
+            <h2>Impact on Ecosystems</h2>
+            <p>
+                The effects of climate change include rising sea levels, melting ice caps, and extreme
+                weather events. These changes threaten biodiversity and disrupt ecosystems worldwide.
+                Scientists have documented widespread impacts on wildlife populations and habitat loss.
+            </p>
+            
+            <h2>Mitigation Strategies</h2>
+            <p>
+                Addressing climate change requires global cooperation and immediate action. Key strategies
+                include transitioning to renewable energy sources, improving energy efficiency, and
+                implementing sustainable land-use practices. Governments, businesses, and individuals all
+                have important roles to play in climate change mitigation.
+            </p>
+            
+            <h2>Future Projections</h2>
+            <p>
+                Climate models project continued warming throughout the 21st century if greenhouse gas
+                emissions remain high. However, limiting global temperature rise to 1.5°C above pre-industrial
+                levels is still possible with rapid and far-reaching transitions in energy, land, urban
+                infrastructure, and industrial systems.
+            </p>
+            
+            <div class="statistics">
+                <h3>Key Statistics</h3>
+                <ul>
+                    <li>Global temperature has risen by approximately 1.1°C since pre-industrial times</li>
+                    <li>Arctic sea ice extent has declined by about 13% per decade</li>
+                    <li>Sea levels have risen by approximately 20cm in the past century</li>
+                    <li>CO2 concentrations have increased by over 40% since the industrial revolution</li>
+                </ul>
+            </div>
+        </article>
+    </main>
+    
+    <footer>
+        <p>&copy; 2020 Mock News Organization. All rights reserved.</p>
+        <nav>
+            <a href="/about">About</a> |
+            <a href="/contact">Contact</a> |
+            <a href="/privacy">Privacy Policy</a>
+        </nav>
+    </footer>
+    
+    <!-- Additional test content for term extraction -->
+    <div class="sidebar">
+        <h3>Related Topics</h3>
+        <ul>
+            <li><a href="/renewable-energy">Renewable Energy</a></li>
+            <li><a href="/carbon-emissions">Carbon Emissions</a></li>
+            <li><a href="/sustainability">Sustainability</a></li>
+            <li><a href="/climate-policy">Climate Policy</a></li>
+        </ul>
+    </div>
+    
+    <!-- Test data for edge cases -->
+    <div class="edge-cases" style="display: none;">
+        <!-- Unicode characters -->
+        <p>Climate change affects regions like São Paulo, Zürich, and København.</p>
+        
+        <!-- Special characters -->
+        <p>Temperature increase: +1.5°C; CO₂ levels: 415ppm; pH < 8.1</p>
+        
+        <!-- Long compound terms -->
+        <p>The Intergovernmental Panel on Climate Change (IPCC) provides comprehensive assessments.</p>
+        
+        <!-- Mixed case and hyphenation -->
+        <p>Climate-change, CLIMATE CHANGE, climate change, and Climate Change should all be detected.</p>
+    </div>
+</body>
+</html>

@@ -1,0 +1,73 @@
+name: E2E Tests
+
+# T069: GitHub Actions workflow for E2E test execution on push/PR
+# T070: Test artifact upload (screenshots/videos on failure)
+# T071: Playwright browser installation (chromium)
+# T072: Test timeout configuration (15 minutes)
+
+on:
+  push:
+    branches: [ main, develop, 001-performance-playwright-tests ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    name: E2E Test Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # T072: 15-minute job timeout
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Install Playwright browsers
+        run: |
+          # T071: Install chromium with dependencies
+          playwright install chromium
+          playwright install-deps chromium
+      
+      - name: Start Streamlit app
+        run: |
+          # Start app in background for E2E tests
+          export ENABLE_PERFORMANCE_OPTS=true
+          export ENABLE_PERF_MONITORING=true
+          streamlit run streamlit_app.py --server.port 8501 --server.headless true &
+          
+          # Wait for app to be ready (max 30s)
+          timeout 30 bash -c 'until curl -s http://localhost:8501 > /dev/null; do sleep 1; done' || exit 1
+      
+      - name: Run E2E tests
+        env:
+          HEADLESS: 'true'
+          APP_URL: 'http://localhost:8501'
+          TEST_TIMEOUT: '30000'
+        run: |
+          pytest tests/e2e/ -v \
+            --tb=short \
+            --maxfail=5 \
+            --screenshot=only-on-failure \
+            --video=retain-on-failure
+      
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          # T070: Upload screenshots/videos on failure
+          name: test-artifacts-${{ github.run_number }}
+          path: |
+            tests/screenshots/
+            tests/videos/
+            playwright-report/
+            test-results/
+          retention-days: 30

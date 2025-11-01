@@ -15,6 +15,7 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional, Set
 from urllib.parse import urlencode
+from pathlib import Path
 import logging
 from collections import Counter, defaultdict
 import csv
@@ -103,10 +104,36 @@ class InternetArchiveClient:
             enable_cache: Activar cache de contenido para evitar re-descargas
         """
         self.rate_limit_delay = rate_limit_delay
+        
+        # T027-T029: Configure session with connection pooling
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'HistoricalTermAnalyzer/1.0 (Educational Research Project)'
         })
+        
+        # T028: Configure HTTPAdapter with connection pooling and retries
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD"]
+        )
+        
+        adapter = HTTPAdapter(
+            pool_connections=10,  # Number of connection pools to cache
+            pool_maxsize=20,      # Maximum connections in pool
+            max_retries=retry_strategy,
+            pool_block=False      # Don't block when pool is full
+        )
+        
+        # T029: Mount adapter for both HTTP and HTTPS
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        logger.info("✅ Connection pooling configured (10 pools, 20 max connections, 3 retries)")
         
         # Sistema de cache simple
         self.enable_cache = enable_cache
@@ -118,6 +145,35 @@ class InternetArchiveClient:
         self.total_requests = 0
         self.failed_requests = 0
         self.cache_hits = 0
+        
+        # T034B: API error threshold tracking
+        self._consecutive_errors = 0
+        self._consecutive_500_errors = 0
+        self._error_threshold = 10  # Pause after 10 consecutive 500 errors
+        self._error_pause_callback = None  # Callback for error notifications
+        
+        # T025: Initialize worker pool manager if performance opts enabled
+        self._use_performance_opts = os.getenv("ENABLE_PERFORMANCE_OPTS", "false").lower() == "true"
+        if self._use_performance_opts:
+            try:
+                from performance.worker_pool import get_worker_pool_manager
+                self._worker_pool_manager = get_worker_pool_manager()
+                logger.info("✅ WorkerPoolManager enabled for HTTP requests")
+            except ImportError as e:
+                logger.warning(f"⚠️ WorkerPoolManager not available: {e}")
+                self._use_performance_opts = False
+                self._worker_pool_manager = None
+        else:
+            self._worker_pool_manager = None
+    
+    def set_error_callback(self, callback):
+        """
+        T034B: Set callback for API error notifications
+        
+        Args:
+            callback: Function(error_message: str, error_count: int) -> None
+        """
+        self._error_pause_callback = callback
         
     def search_items(self, query_params: Dict, max_results: int = 700) -> List[Document]:
         """
@@ -134,6 +190,66 @@ class InternetArchiveClient:
         
         documents = []
         domains = query_params.get('domains', self.POPULAR_DOMAINS[:5])
+
+        # If MOCK_CDX environment variable is set, load mock responses from local fixtures
+        if os.getenv('MOCK_CDX', 'false').lower() == 'true':
+            try:
+                fixtures_path = Path(__file__).parent / 'tests' / 'fixtures' / 'mock_cdx_responses.json'
+                # Fallback to repository tests/fixtures
+                if not fixtures_path.exists():
+                    fixtures_path = Path.cwd() / 'tests' / 'fixtures' / 'mock_cdx_responses.json'
+
+                with open(fixtures_path, 'r') as fh:
+                    mock_data = json.load(fh)
+
+                scenarios = mock_data.get('test_scenarios', {})
+
+                for domain in domains:
+                    # Find scenario matching domain
+                    matched = None
+                    for name, scenario in scenarios.items():
+                        url = scenario.get('url', '')
+                        if domain in url or (url and domain in url):
+                            matched = scenario
+                            break
+
+                    # If no exact match, prefer successful_query if present
+                    if not matched and 'successful_query' in scenarios:
+                        matched = scenarios['successful_query']
+
+                    if not matched:
+                        continue
+
+                    resp = matched.get('response', [])
+                    # Skip header row if present
+                    if resp and isinstance(resp[0], list) and resp[0][0].lower().startswith('urlkey'):
+                        resp = resp[1:]
+
+                    for entry in resp:
+                        try:
+                            # Expect timestamp, original at minimum
+                            if len(entry) >= 2:
+                                timestamp = entry[1]
+                                original_url = entry[2] if len(entry) > 2 else entry[1]
+                                date_obj = datetime.strptime(timestamp[:14], '%Y%m%d%H%M%S')
+                                identifier = f"mock_{domain}_{timestamp}_{len(documents)}"
+                                title = original_url.rstrip('/').split('/')[-1] or domain
+                                doc = Document(identifier, title, date_obj, date_obj.year)
+                                doc.metadata = {
+                                    'original_url': original_url,
+                                    'wayback_url': f"{self.WAYBACK_BASE}{timestamp}/{original_url}",
+                                    'mimetype': 'text/html',
+                                    'digest': entry[5] if len(entry) > 5 else '',
+                                    'source_api': 'mock'
+                                }
+                                documents.append(doc)
+                        except Exception:
+                            continue
+
+                logger.info(f"MOCK_CDX enabled: returning {len(documents)} mock documents")
+                return documents[:max_results]
+            except Exception as e:
+                logger.warning(f"Failed to load MOCK_CDX fixtures: {e}")
         
         # Buscar en cada dominio usando método robusto
         for domain in domains:
@@ -653,6 +769,30 @@ class InternetArchiveClient:
 
             response = self.session.get(url, timeout=timeout)
             
+            # T034B: Track consecutive 500 errors
+            if response.status_code == 500:
+                self._consecutive_500_errors += 1
+                logger.warning(f"HTTP 500 error ({self._consecutive_500_errors} consecutive)")
+                
+                # Pause analysis after threshold
+                if self._consecutive_500_errors >= self._error_threshold:
+                    error_msg = f"⚠️ Paused: {self._consecutive_500_errors} consecutive 500 errors from API"
+                    logger.error(error_msg)
+                    
+                    # Call error notification callback if set
+                    if self._error_pause_callback:
+                        self._error_pause_callback(error_msg, self._consecutive_500_errors)
+                    
+                    # Raise exception to halt analysis
+                    raise RuntimeError(f"Analysis paused due to {self._consecutive_500_errors} consecutive API 500 errors. Please retry later.")
+                
+                return None
+            
+            # Reset consecutive error counter on success
+            if response.status_code == 200:
+                self._consecutive_errors = 0
+                self._consecutive_500_errors = 0
+            
             # Manejar códigos de error específicos
             if response.status_code == 429:  # Too Many Requests
                 logger.warning("Rate limit exceeded, esperando más tiempo...")
@@ -666,6 +806,7 @@ class InternetArchiveClient:
                 try:
                     response = self.session.get(url, timeout=timeout)
                     if response.status_code == 200:
+                        self._consecutive_500_errors = 0  # Reset on success
                         return response
                 except:
                     pass
@@ -673,6 +814,7 @@ class InternetArchiveClient:
                 
             elif response.status_code != 200:
                 logger.warning(f"HTTP {response.status_code} para {url}")
+                self._consecutive_errors += 1
                 return None
                 
             return response
@@ -792,11 +934,31 @@ class TextProcessor:
         self.whitespace_pattern = re.compile(r'\s+')
         self.punctuation_pattern = re.compile(f'[{re.escape(string.punctuation)}]')
         
-        # Cache para términos extraídos
+        # Cache para términos extraídos (legacy - will be replaced by CacheManager)
         self._term_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
         
+        # T021: Integrate performance modules if enabled
+        self._use_performance_opts = os.getenv("ENABLE_PERFORMANCE_OPTS", "false").lower() == "true"
+        
+        if self._use_performance_opts:
+            try:
+                from performance.cache_manager import get_cache_manager
+                from performance.worker_pool import get_worker_pool_manager
+                self._cache_manager = get_cache_manager()
+                self._worker_pool_manager = get_worker_pool_manager()
+                logger.info("✅ Performance optimizations enabled (CacheManager + WorkerPoolManager)")
+            except ImportError as e:
+                logger.warning(f"⚠️ Performance modules not available: {e}")
+                self._use_performance_opts = False
+                self._cache_manager = None
+                self._worker_pool_manager = None
+        else:
+            self._cache_manager = None
+            self._worker_pool_manager = None
+        
+    # T019: Add LRU cache for HTML parsing - keep existing decorator
     @lru_cache(maxsize=1000)
     def _clean_and_normalize_text(self, text: str) -> str:
         """Limpiar y normalizar texto usando cache"""
@@ -812,6 +974,7 @@ class TextProcessor:
         
         return text.strip()
         
+    # T020: Enhanced caching for term extraction with CacheManager integration
     def extract_terms(self, text: str) -> List[str]:
         """
         Extraer términos relevantes del texto con optimizaciones
@@ -824,30 +987,55 @@ class TextProcessor:
         """
         if not text:
             return []
+        
+        # T020: Use CacheManager if performance opts enabled
+        if self._use_performance_opts and self._cache_manager:
+            import hashlib
+            cache_key = hashlib.sha256(text[:1000].encode()).hexdigest()
             
-        # Verificar cache
-        text_hash = hash(text[:1000])  # Usar hash de los primeros 1000 caracteres
-        if text_hash in self._term_cache:
-            self._cache_hits += 1
-            return self._term_cache[text_hash]
+            # Try cache first
+            cached_terms = self._cache_manager.get(cache_key, "term_extraction")
+            if cached_terms is not None:
+                self._cache_hits += 1
+                return cached_terms
             
-        self._cache_misses += 1
-        
-        # Limpiar y normalizar
-        cleaned_text = self._clean_and_normalize_text(text)
-        
-        # Extraer palabras usando regex compilada
-        words = self.word_pattern.findall(cleaned_text)
-        
-        # Filtrar stop words en una sola pasada
-        terms = [word for word in words 
-                if word not in self.STOP_WORDS and len(word) >= 2]
-        
-        # Guardar en cache (limitar tamaño del cache)
-        if len(self._term_cache) < 500:
-            self._term_cache[text_hash] = terms
+            self._cache_misses += 1
             
-        return terms
+            # Extract terms
+            cleaned_text = self._clean_and_normalize_text(text)
+            words = self.word_pattern.findall(cleaned_text)
+            terms = [word for word in words 
+                    if word not in self.STOP_WORDS and len(word) >= 2]
+            
+            # Store in cache
+            terms_size = len(text) + len(terms) * 20  # Approximate size
+            self._cache_manager.put(cache_key, "term_extraction", terms, terms_size)
+            
+            return terms
+        else:
+            # Legacy caching (fallback when performance opts disabled)
+            text_hash = hash(text[:1000])
+            if text_hash in self._term_cache:
+                self._cache_hits += 1
+                return self._term_cache[text_hash]
+                
+            self._cache_misses += 1
+            
+            # Limpiar y normalizar
+            cleaned_text = self._clean_and_normalize_text(text)
+            
+            # Extraer palabras usando regex compilada
+            words = self.word_pattern.findall(cleaned_text)
+            
+            # Filtrar stop words en una sola pasada
+            terms = [word for word in words 
+                    if word not in self.STOP_WORDS and len(word) >= 2]
+            
+            # Guardar en cache (limitar tamaño del cache)
+            if len(self._term_cache) < 500:
+                self._term_cache[text_hash] = terms
+                
+            return terms
         
     def _process_document_batch(self, documents: List) -> Dict[str, int]:
         """Procesar un lote de documentos y retornar frecuencias"""
@@ -899,35 +1087,74 @@ class TextProcessor:
         return {}
         
     def _calculate_frequencies_parallel(self, documents: List) -> Dict[str, int]:
-        """Calcular frecuencias usando procesamiento paralelo"""
-        logger.info(f"Usando procesamiento paralelo con {self.max_workers} workers")
-        
-        # Dividir documentos en lotes
-        batch_size = max(1, len(documents) // self.max_workers)
-        document_batches = [documents[i:i + batch_size] 
-                           for i in range(0, len(documents), batch_size)]
-        
-        # Procesar lotes en paralelo
-        combined_frequencies = defaultdict(int)
-        
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Enviar lotes a procesar
-            future_to_batch = {
-                executor.submit(self._process_document_batch, batch): batch 
-                for batch in document_batches
-            }
+        """
+        T024-T026: Calcular frecuencias usando WorkerPoolManager con dynamic workers
+        """
+        # T023: Use dynamic worker pool if performance opts enabled
+        if self._use_performance_opts and self._worker_pool_manager:
+            # T026: Use CPU-bound pool for text processing operations
+            worker_pool = self._worker_pool_manager.create_pool("cpu_bound", len(documents))
+            logger.info(f"✅ Usando WorkerPoolManager dinámico con {worker_pool.max_workers} workers (CPU-bound)")
             
-            # Recopilar resultados
-            for future in as_completed(future_to_batch):
-                try:
-                    batch_freq = future.result()
-                    for term, freq in batch_freq.items():
-                        combined_frequencies[term] += freq
-                except Exception as e:
-                    logger.error(f"Error procesando lote: {e}")
+            # Dividir documentos en lotes
+            batch_size = max(1, len(documents) // worker_pool.max_workers)
+            document_batches = [documents[i:i + batch_size] 
+                               for i in range(0, len(documents), batch_size)]
+            
+            # Procesar lotes en paralelo usando WorkerPoolManager
+            combined_frequencies = defaultdict(int)
+            
+            try:
+                # Submit tasks to worker pool
+                futures = [
+                    self._worker_pool_manager.submit_task(worker_pool, self._process_document_batch, batch)
+                    for batch in document_batches
+                ]
+                
+                # Recopilar resultados
+                for future in as_completed(futures):
+                    try:
+                        batch_freq = future.result()
+                        for term, freq in batch_freq.items():
+                            combined_frequencies[term] += freq
+                    except Exception as e:
+                        logger.error(f"Error procesando lote: {e}")
+            finally:
+                # Cleanup worker pool
+                self._worker_pool_manager.shutdown(worker_pool, wait=True)
                     
-        logger.info(f"Procesamiento paralelo completado. Términos únicos: {len(combined_frequencies)}")
-        return dict(combined_frequencies)
+            logger.info(f"Procesamiento paralelo completado. Términos únicos: {len(combined_frequencies)}")
+            return dict(combined_frequencies)
+        else:
+            # Legacy ThreadPoolExecutor (fallback)
+            logger.info(f"Usando procesamiento paralelo con {self.max_workers} workers (legacy)")
+            
+            # Dividir documentos en lotes
+            batch_size = max(1, len(documents) // self.max_workers)
+            document_batches = [documents[i:i + batch_size] 
+                               for i in range(0, len(documents), batch_size)]
+            
+            # Procesar lotes en paralelo
+            combined_frequencies = defaultdict(int)
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Enviar lotes a procesar
+                future_to_batch = {
+                    executor.submit(self._process_document_batch, batch): batch 
+                    for batch in document_batches
+                }
+                
+                # Recopilar resultados
+                for future in as_completed(future_to_batch):
+                    try:
+                        batch_freq = future.result()
+                        for term, freq in batch_freq.items():
+                            combined_frequencies[term] += freq
+                    except Exception as e:
+                        logger.error(f"Error procesando lote: {e}")
+                        
+            logger.info(f"Procesamiento paralelo completado. Términos únicos: {len(combined_frequencies)}")
+            return dict(combined_frequencies)
         
     def _calculate_frequencies_sequential(self, documents: List) -> Dict[str, int]:
         """Calcular frecuencias secuencialmente"""
@@ -942,16 +1169,35 @@ class TextProcessor:
         return dict(Counter(all_terms))
         
     def get_cache_stats(self) -> Dict:
-        """Obtener estadísticas del cache"""
-        total_requests = self._cache_hits + self._cache_misses
-        hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
-        
-        return {
-            'cache_hits': self._cache_hits,
-            'cache_misses': self._cache_misses,
-            'hit_rate_percent': round(hit_rate, 2),
-            'cache_size': len(self._term_cache)
-        }
+        """
+        T022: Obtener estadísticas del cache con soporte para CacheManager
+        """
+        # T022: Return CacheManager statistics if performance opts enabled
+        if self._use_performance_opts and self._cache_manager:
+            cache_stats = self._cache_manager.get_statistics()
+            # Merge with legacy stats for compatibility
+            total_requests = self._cache_hits + self._cache_misses
+            hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
+            
+            return {
+                'cache_hits': cache_stats.get('hit_count', self._cache_hits),
+                'cache_misses': cache_stats.get('miss_count', self._cache_misses),
+                'hit_rate_percent': cache_stats.get('hit_rate_percent', round(hit_rate, 2)),
+                'cache_size': cache_stats.get('total_entries', len(self._term_cache)),
+                'cache_size_mb': cache_stats.get('total_size_mb', 0),
+                'by_type': cache_stats.get('by_type', {})
+            }
+        else:
+            # Legacy cache statistics
+            total_requests = self._cache_hits + self._cache_misses
+            hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
+            
+            return {
+                'cache_hits': self._cache_hits,
+                'cache_misses': self._cache_misses,
+                'hit_rate_percent': round(hit_rate, 2),
+                'cache_size': len(self._term_cache)
+            }
         
     def get_top_terms(self, frequencies: Dict[str, int], top_n: int = 50) -> List[tuple]:
         """
@@ -1108,6 +1354,36 @@ class HistoricalTermAnalyzer:
         self.visualizer = Visualizer()
         self.progress_callback = progress_callback
         
+        # T030-T033: Initialize performance monitor if enabled
+        self._use_perf_monitoring = os.getenv("ENABLE_PERF_MONITORING", "false").lower() == "true"
+        if self._use_perf_monitoring:
+            try:
+                from performance import get_monitor
+                import uuid
+                self._analysis_id = str(uuid.uuid4())
+                self._perf_monitor = get_monitor(self._analysis_id)
+                logger.info(f"✅ Performance monitoring enabled (analysis_id: {self._analysis_id})")
+            except ImportError as e:
+                logger.warning(f"⚠️ Performance monitoring not available: {e}")
+                self._use_perf_monitoring = False
+                self._perf_monitor = None
+        else:
+            self._perf_monitor = None
+        
+        # T041: Initialize memory profiler if enabled
+        self._use_memory_profiling = os.getenv("ENABLE_PERF_MONITORING", "false").lower() == "true"
+        if self._use_memory_profiling:
+            try:
+                from performance.memory_profiler import get_memory_profiler
+                self._memory_profiler = get_memory_profiler()
+                logger.info(f"✅ Memory profiling enabled (baseline: {self._memory_profiler.get_current_usage():.1f}MB)")
+            except ImportError as e:
+                logger.warning(f"⚠️ Memory profiling not available: {e}")
+                self._use_memory_profiling = False
+                self._memory_profiler = None
+        else:
+            self._memory_profiler = None
+    
     def analyze_period(self, 
                       start_year: int, 
                       end_year: int, 
@@ -1142,11 +1418,25 @@ class HistoricalTermAnalyzer:
         }
         
         try:
-            # Paso 1: Búsqueda de documentos (10% del progreso)
+            # T030: Paso 1: Búsqueda de documentos (10% del progreso)
+            search_phase_id = None
+            if self._use_perf_monitoring and self._perf_monitor:
+                search_phase_id = self._perf_monitor.start_phase("search")
+            
             if self.progress_callback:
                 self.progress_callback(5, "Buscando páginas web en Internet Archive...")
             
             documents = self.client.search_items(query_params, max_results=max_documents)
+            
+            if self._use_perf_monitoring and self._perf_monitor and search_phase_id:
+                search_duration = self._perf_monitor.end_phase(search_phase_id)
+                logger.info(f"⏱️ Search phase completed in {search_duration:.2f}s")
+                
+                # T041: Record memory usage at phase boundary
+                if self._use_memory_profiling and self._memory_profiler:
+                    mem_mb = self._memory_profiler.get_current_usage()
+                    self._perf_monitor.record_metric("memory_usage", mem_mb, "MB", "search")
+                    logger.debug(f"💾 Memory after search: {mem_mb:.1f}MB")
             
             if not documents:
                 return {'error': 'No se encontraron páginas web para los criterios especificados'}
@@ -1156,11 +1446,25 @@ class HistoricalTermAnalyzer:
             
             self.memory.add_documents(documents)
             
-            # Paso 2: Descarga de contenido (10% - 70% del progreso)
+            # T031: Paso 2: Descarga de contenido (10% - 70% del progreso)
+            download_phase_id = None
+            if self._use_perf_monitoring and self._perf_monitor:
+                download_phase_id = self._perf_monitor.start_phase("download")
+            
             if self.progress_callback:
                 self.progress_callback(15, "Iniciando descarga de contenido...")
             
             self._download_document_content(documents)
+            
+            if self._use_perf_monitoring and self._perf_monitor and download_phase_id:
+                download_duration = self._perf_monitor.end_phase(download_phase_id)
+                logger.info(f"⏱️ Download phase completed in {download_duration:.2f}s")
+                
+                # T041: Record memory usage at phase boundary
+                if self._use_memory_profiling and self._memory_profiler:
+                    mem_mb = self._memory_profiler.get_current_usage()
+                    self._perf_monitor.record_metric("memory_usage", mem_mb, "MB", "download")
+                    logger.debug(f"💾 Memory after download: {mem_mb:.1f}MB")
             
             # Filtrar documentos con contenido
             docs_with_content = [d for d in documents if d.text_content]
@@ -1171,13 +1475,27 @@ class HistoricalTermAnalyzer:
             if self.progress_callback:
                 self.progress_callback(75, f"{len(docs_with_content)} páginas con contenido válido")
             
-            # Paso 3: Procesamiento de términos (70% - 90% del progreso)
+            # T032: Paso 3: Procesamiento de términos (70% - 90% del progreso)
+            analyze_phase_id = None
+            if self._use_perf_monitoring and self._perf_monitor:
+                analyze_phase_id = self._perf_monitor.start_phase("analyze")
+            
             if self.progress_callback:
                 self.progress_callback(80, "Procesando y contando términos...")
             
             # Análisis agregado
             frequencies = self.processor.calculate_frequencies(docs_with_content)
             top_terms = self.processor.get_top_terms(frequencies, top_n=50)
+            
+            if self._use_perf_monitoring and self._perf_monitor and analyze_phase_id:
+                analyze_duration = self._perf_monitor.end_phase(analyze_phase_id)
+                logger.info(f"⏱️ Analyze phase completed in {analyze_duration:.2f}s")
+                
+                # T041: Record memory usage at phase boundary
+                if self._use_memory_profiling and self._memory_profiler:
+                    mem_mb = self._memory_profiler.get_current_usage()
+                    self._perf_monitor.record_metric("memory_usage", mem_mb, "MB", "analyze")
+                    logger.debug(f"💾 Memory after analyze: {mem_mb:.1f}MB")
             
             self.memory.set_frequencies(frequencies)
             self.memory.set_top_terms(top_terms)
@@ -1213,6 +1531,9 @@ class HistoricalTermAnalyzer:
             
             if self.progress_callback:
                 self.progress_callback(100, "¡Análisis completado!")
+            
+            # T038-T039: Cleanup and garbage collection after analysis
+            self._cleanup_analysis_memory(docs_with_content)
             
             logger.info("Análisis completado exitosamente")
             return results
@@ -1271,9 +1592,12 @@ class HistoricalTermAnalyzer:
         # Usar paralelización para downloads de red
         max_workers = min(8, total_docs)  # Máximo 8 workers para evitar sobrecargar el servidor
         
-        # Variables para tracking de progreso
+        # T034A: Variables para tracking de progreso no bloqueante
+        # Update every 5 seconds OR every 10 pages (whichever comes first)
         completed_docs = 0
-        progress_step = max(1, total_docs // 60)  # Actualizar progreso cada ~1.6% (60 pasos entre 15% y 75%)
+        progress_step = min(10, max(1, total_docs // 60))  # At least every 10 pages
+        last_update_time = time.time()
+        update_interval = 5.0  # 5 seconds
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Enviar todas las tareas de descarga
@@ -1291,14 +1615,24 @@ class HistoricalTermAnalyzer:
                     success = future.result()
                     if success:
                         successful_downloads += 1
-                        
-                    # Reportar progreso (15% - 75% del rango total)
-                    if self.progress_callback and completed_docs % progress_step == 0:
+                    
+                    # T034A: Non-blocking progress updates
+                    # Update every 5 seconds OR every 10 pages (whichever comes first)
+                    current_time = time.time()
+                    time_elapsed = current_time - last_update_time
+                    
+                    should_update = (
+                        (completed_docs % progress_step == 0) or  # Every 10 pages
+                        (time_elapsed >= update_interval)  # Every 5 seconds
+                    )
+                    
+                    if self.progress_callback and should_update:
                         progress_percent = 15 + int((completed_docs / total_docs) * 60)
                         self.progress_callback(
                             progress_percent, 
                             f"Descargando: {completed_docs}/{total_docs} páginas ({successful_downloads} exitosas)"
                         )
+                        last_update_time = current_time  # Reset timer
                         
                 except Exception as e:
                     logger.error(f"Error procesando resultado de descarga: {e}")
@@ -1325,6 +1659,40 @@ class HistoricalTermAnalyzer:
         except Exception as e:
             logger.debug(f"Error en descarga individual de {doc.identifier}: {e}")
             return False
+    
+    def _cleanup_analysis_memory(self, documents: List[Document]):
+        """
+        T038-T039: Clean up memory after analysis completion.
+        
+        Clears intermediate data structures and triggers garbage collection
+        to ensure memory is released properly.
+        
+        Args:
+            documents: Document list to clear content from
+        """
+        import gc
+        
+        logger.debug("Starting memory cleanup...")
+        
+        # T039: Clear intermediate data structures
+        # Clear document content (keep metadata for results)
+        for doc in documents:
+            if hasattr(doc, 'text_content'):
+                doc.text_content = None
+        
+        # Clear any cached HTML content
+        if hasattr(self.client, '_html_cache'):
+            self.client._html_cache = {}
+        
+        # Clear processor caches if they exist
+        if hasattr(self.processor, '_term_cache'):
+            self.processor._term_cache = {}
+        
+        # T038: Force garbage collection (two passes for cyclic references)
+        collected = gc.collect()
+        gc.collect()  # Second pass for cyclic references
+        
+        logger.debug(f"Memory cleanup complete (collected {collected} objects)")
         
     def _generate_results(self) -> Dict:
         """Generar diccionario de resultados completos"""

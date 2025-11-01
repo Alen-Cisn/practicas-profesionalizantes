@@ -1,0 +1,52 @@
+{
+  "test_scenarios": {
+    "successful_query": {
+      "url": "https://example.com",
+      "term": "climate change",
+      "response": [
+        ["urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"],
+        ["com,example)/", "20200101000000", "https://example.com", "text/html", "200", "ABCD1234", "12345"],
+        ["com,example)/", "20200615120000", "https://example.com", "text/html", "200", "EFGH5678", "12367"],
+        ["com,example)/", "20210301090000", "https://example.com", "text/html", "200", "IJKL9012", "12389"]
+      ]
+    },
+    "empty_results": {
+      "url": "https://notfound.example.com",
+      "term": "nonexistent",
+      "response": []
+    },
+    "paginated_results": {
+      "url": "https://popular.example.com",
+      "term": "technology",
+      "response": [
+        ["urlkey", "timestamp", "original", "mimetype", "statuscode", "digest", "length"],
+        ["com,example,popular)/", "20150101000000", "https://popular.example.com", "text/html", "200", "A1B2C3D4", "10000"],
+        ["com,example,popular)/", "20150615000000", "https://popular.example.com", "text/html", "200", "E5F6G7H8", "10100"],
+        ["com,example,popular)/", "20160101000000", "https://popular.example.com", "text/html", "200", "I9J0K1L2", "10200"],
+        ["com,example,popular)/", "20160615000000", "https://popular.example.com", "text/html", "200", "M3N4O5P6", "10300"],
+        ["com,example,popular)/", "20170101000000", "https://popular.example.com", "text/html", "200", "Q7R8S9T0", "10400"]
+      ]
+    },
+    "error_500": {
+      "url": "https://error.example.com",
+      "term": "test",
+      "error": "Internal Server Error",
+      "status_code": 500
+    },
+    "rate_limit": {
+      "url": "https://throttled.example.com",
+      "term": "test",
+      "error": "Rate limit exceeded",
+      "status_code": 429
+    }
+  },
+  "mock_html_metadata": {
+    "snapshot_dates": [
+      "20200101000000",
+      "20200615120000",
+      "20210301090000"
+    ],
+    "page_count": 3,
+    "url_pattern": "https://web.archive.org/web/{timestamp}/https://example.com"
+  }
+}

@@ -4,3 +4,8 @@ plotly>=5.15.0
 pandas>=1.5.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+
+# Performance & Testing (Feature 001-performance-playwright-tests)
+playwright>=1.40.0
+pytest-playwright==0.4.3
+pytest==7.4.3
