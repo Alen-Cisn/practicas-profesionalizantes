@@ -32,9 +32,9 @@ def test_desktop_viewport(page: Page, app_url: str, desktop_viewport: dict):
     page.set_viewport_size(desktop_viewport)
     page.goto(app_url, wait_until="networkidle")
     
-    # Verify page loaded
-    header = page.locator('text=Historical Term Analyzer')
-    expect(header).to_be_visible()
+    # Verify page loaded - look for header with class or containing text
+    header = page.locator('h1:has-text("Historical Term Analyzer"), .main-header')
+    expect(header.first).to_be_visible()
     
     # Verify no horizontal scroll needed
     page_width = page.evaluate('document.documentElement.scrollWidth')
@@ -71,9 +71,9 @@ def test_tablet_viewport(page: Page, app_url: str, tablet_viewport: dict):
     page.set_viewport_size(tablet_viewport)
     page.goto(app_url, wait_until="networkidle")
     
-    # Verify page loaded
-    header = page.locator('text=Historical Term Analyzer')
-    expect(header).to_be_visible()
+    # Verify page loaded - look for header with class or containing text
+    header = page.locator('h1:has-text("Historical Term Analyzer"), .main-header')
+    expect(header.first).to_be_visible()
     
     # Verify no horizontal scroll needed
     page_width = page.evaluate('document.documentElement.scrollWidth')
@@ -121,9 +121,9 @@ def test_mobile_viewport(page: Page, app_url: str, mobile_viewport: dict):
     page.set_viewport_size(mobile_viewport)
     page.goto(app_url, wait_until="networkidle")
     
-    # Verify page loaded
-    header = page.locator('text=Historical Term Analyzer')
-    expect(header).to_be_visible()
+    # Verify page loaded - look for header with class or containing text
+    header = page.locator('h1:has-text("Historical Term Analyzer"), .main-header')
+    expect(header.first).to_be_visible()
     
     # Verify no horizontal scroll needed
     page_width = page.evaluate('document.documentElement.scrollWidth')
@@ -174,9 +174,9 @@ def test_keyboard_navigation(page: Page, app_url: str):
     """
     page.goto(app_url, wait_until="networkidle")
     
-    # Verify page loaded
-    header = page.locator('text=Historical Term Analyzer')
-    expect(header).to_be_visible()
+    # Verify page loaded - look for header with class or containing text
+    header = page.locator('h1:has-text("Historical Term Analyzer"), .main-header')
+    expect(header.first).to_be_visible()
     
     # Start keyboard navigation from top of page
     page.keyboard.press('Tab')
@@ -236,12 +236,14 @@ def test_keyboard_navigation(page: Page, app_url: str):
         page.wait_for_timeout(200)
         
         # Verify it's focused
+        # Use querySelectorAll and match text content to locate the button element in the DOM
         is_focused = page.evaluate('''
-            (selector) => {
-                const btn = document.querySelector(selector);
+            (text) => {
+                const candidates = Array.from(document.querySelectorAll('button'));
+                const btn = candidates.find(b => b.innerText && b.innerText.trim().includes(text));
                 return document.activeElement === btn;
             }
-        ''', 'button:has-text("Ejecutar")')
+        ''', 'Ejecutar')
         
         if is_focused:
             print("✅ Can focus buttons with keyboard")

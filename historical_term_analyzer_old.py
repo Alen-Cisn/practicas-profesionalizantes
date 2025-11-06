@@ -15,7 +15,6 @@ import json
 from datetime import datetime
 from typing import List, Dict, Optional, Set
 from urllib.parse import urlencode
-from pathlib import Path
 import logging
 from collections import Counter, defaultdict
 import csv
@@ -62,8 +61,7 @@ class Document:
             'title': self.title,
             'date': self.date.isoformat() if self.date else None,
             'year': self.year,
-            # text_content may be None after cleanup; guard against that
-            'content_length': len(self.text_content or ""),
+            'content_length': len(self.text_content),
             **self.metadata
         }
         
@@ -85,7 +83,6 @@ class InternetArchiveClient:
     # URLs base de Internet Archive - enfoque en Wayback Machine
     CDX_API = "http://web.archive.org/cdx/search/cdx"
     WAYBACK_BASE = "http://web.archive.org/web/"
-    AVAILABILITY_API = "http://archive.org/wayback/available"
     
     # Dominios populares para búsqueda de páginas web
     POPULAR_DOMAINS = [
@@ -105,37 +102,10 @@ class InternetArchiveClient:
             enable_cache: Activar cache de contenido para evitar re-descargas
         """
         self.rate_limit_delay = rate_limit_delay
-        
-        # T027-T029: Configure session with connection pooling
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'HistoricalTermAnalyzer/1.0 (Educational Research Project)'
         })
-        
-        # T028: Configure HTTPAdapter with connection pooling and retries
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        
-        # Disable automatic retries - handle manually for better control (like old version)
-        retry_strategy = Retry(
-            total=0,  # No automatic retries
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "HEAD"]
-        )
-        
-        adapter = HTTPAdapter(
-            pool_connections=10,  # Number of connection pools to cache
-            pool_maxsize=20,      # Maximum connections in pool
-            max_retries=retry_strategy,
-            pool_block=False      # Don't block when pool is full
-        )
-        
-        # T029: Mount adapter for both HTTP and HTTPS
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-        
-        logger.info("✅ Connection pooling configured (10 pools, 20 max connections, 0 auto-retries)")
         
         # Sistema de cache simple
         self.enable_cache = enable_cache
@@ -147,35 +117,6 @@ class InternetArchiveClient:
         self.total_requests = 0
         self.failed_requests = 0
         self.cache_hits = 0
-        
-        # T034B: API error threshold tracking
-        self._consecutive_errors = 0
-        self._consecutive_500_errors = 0
-        self._error_threshold = 10  # Pause after 10 consecutive 500 errors
-        self._error_pause_callback = None  # Callback for error notifications
-        
-        # T025: Initialize worker pool manager if performance opts enabled
-        self._use_performance_opts = os.getenv("ENABLE_PERFORMANCE_OPTS", "false").lower() == "true"
-        if self._use_performance_opts:
-            try:
-                from performance.worker_pool import get_worker_pool_manager
-                self._worker_pool_manager = get_worker_pool_manager()
-                logger.info("✅ WorkerPoolManager enabled for HTTP requests")
-            except ImportError as e:
-                logger.warning(f"⚠️ WorkerPoolManager not available: {e}")
-                self._use_performance_opts = False
-                self._worker_pool_manager = None
-        else:
-            self._worker_pool_manager = None
-    
-    def set_error_callback(self, callback):
-        """
-        T034B: Set callback for API error notifications
-        
-        Args:
-            callback: Function(error_message: str, error_count: int) -> None
-        """
-        self._error_pause_callback = callback
         
     def search_items(self, query_params: Dict, max_results: int = 700) -> List[Document]:
         """
@@ -190,84 +131,13 @@ class InternetArchiveClient:
         """
         logger.info(f"Iniciando búsqueda de páginas web con parámetros: {query_params}")
         
-        # Check if CDX API is available with a quick health check
-        if os.getenv('MOCK_CDX', 'false').lower() != 'true':
-            try:
-                health_response = self.session.head(self.CDX_API, timeout=5)
-                if health_response.status_code not in [200, 400, 404]:  # 400/404 means API is up
-                    logger.warning(f"⚠️ CDX API returned {health_response.status_code} - service may be slow")
-            except Exception:
-                logger.warning("⚠️ CDX API may be unavailable. Consider using MOCK_CDX=true for testing")
-        
         documents = []
-        domains = query_params.get('domains', self.POPULAR_DOMAINS[:5])
-
-        # If MOCK_CDX environment variable is set, load mock responses from local fixtures
-        if os.getenv('MOCK_CDX', 'false').lower() == 'true':
-            try:
-                fixtures_path = Path(__file__).parent / 'tests' / 'fixtures' / 'mock_cdx_responses.json'
-                # Fallback to repository tests/fixtures
-                if not fixtures_path.exists():
-                    fixtures_path = Path.cwd() / 'tests' / 'fixtures' / 'mock_cdx_responses.json'
-
-                with open(fixtures_path, 'r') as fh:
-                    mock_data = json.load(fh)
-
-                scenarios = mock_data.get('test_scenarios', {})
-
-                for domain in domains:
-                    # Find scenario matching domain
-                    matched = None
-                    for name, scenario in scenarios.items():
-                        url = scenario.get('url', '')
-                        if domain in url or (url and domain in url):
-                            matched = scenario
-                            break
-
-                    # If no exact match, prefer successful_query if present
-                    if not matched and 'successful_query' in scenarios:
-                        matched = scenarios['successful_query']
-
-                    if not matched:
-                        continue
-
-                    resp = matched.get('response', [])
-                    # Skip header row if present
-                    if resp and isinstance(resp[0], list) and resp[0][0].lower().startswith('urlkey'):
-                        resp = resp[1:]
-
-                    for entry in resp:
-                        try:
-                            # Expect timestamp, original at minimum
-                            if len(entry) >= 2:
-                                timestamp = entry[1]
-                                original_url = entry[2] if len(entry) > 2 else entry[1]
-                                date_obj = datetime.strptime(timestamp[:14], '%Y%m%d%H%M%S')
-                                identifier = f"mock_{domain}_{timestamp}_{len(documents)}"
-                                title = original_url.rstrip('/').split('/')[-1] or domain
-                                doc = Document(identifier, title, date_obj, date_obj.year)
-                                doc.metadata = {
-                                    'original_url': original_url,
-                                    'wayback_url': f"{self.WAYBACK_BASE}{timestamp}/{original_url}",
-                                    'mimetype': 'text/html',
-                                    'digest': entry[5] if len(entry) > 5 else '',
-                                    'source_api': 'mock'
-                                }
-                                documents.append(doc)
-                        except Exception:
-                            continue
-
-                logger.info(f"MOCK_CDX enabled: returning {len(documents)} mock documents")
-                return documents[:max_results]
-            except Exception as e:
-                logger.warning(f"Failed to load MOCK_CDX fixtures: {e}")
+        domains = query_params.get('domains', self.POPULAR_DOMAINS[:5])  # Usar algunos dominios por defecto
         
-        # Buscar en cada dominio usando método simple y confiable (una request por dominio)
+        # Buscar en cada dominio
         for domain in domains:
             try:
-                logger.info(f"Buscando páginas en {domain}...")
                 domain_documents = self._search_domain_pages(domain, query_params, max_results // len(domains))
-                
                 documents.extend(domain_documents)
                 
                 logger.info(f"Dominio {domain}: {len(domain_documents)} páginas encontradas")
@@ -293,21 +163,19 @@ class InternetArchiveClient:
         start_year = query_params.get('start_year', 1995)
         end_year = query_params.get('end_year', 2005)
         
-        # Parámetros para CDX API - optimizados para mejor respuesta
+        # Parámetros para CDX API
         params = {
             'url': f'{domain}/*',
             'from': f'{start_year}0101',
             'to': f'{end_year}1231',
             'output': 'json',
-            'fl': 'timestamp,original,mimetype,statuscode,digest',
+            'fl': 'timestamp,original,mimetype,statuscode,digest,length',
             'filter': 'statuscode:200',
-            'filter': 'mimetype:text/html',
-            'collapse': 'urlkey',  # Mejor que digest para evitar duplicados
-            'limit': min(max_per_domain, 1000)  # Limitar requests grandes
+            'collapse': 'digest',  # Evitar duplicados
+            'limit': max_per_domain
         }
         
-        # Use longer timeout for CDX API (60s like the old working version)
-        response = self._make_request(self.CDX_API, params, timeout=60)
+        response = self._make_request(self.CDX_API, params)
         if not response:
             return []
             
@@ -318,12 +186,10 @@ class InternetArchiveClient:
             # Saltar la primera línea (headers) si existe
             if data and isinstance(data[0], list) and data[0][0] == 'timestamp':
                 data = data[1:]
-            
-            logger.info(f"Recibidas {len(data)} entradas de CDX para {domain}")
                 
             for entry in data:
-                if len(entry) >= 5:  # Ahora son 5 campos en lugar de 6
-                    timestamp, original_url, mimetype, statuscode, digest = entry[:5]
+                if len(entry) >= 6:
+                    timestamp, original_url, mimetype, statuscode, digest, length = entry[:6]
                     
                     # Filtrar solo contenido HTML
                     if mimetype and ('text/html' in mimetype or 'html' in mimetype):
@@ -337,110 +203,6 @@ class InternetArchiveClient:
             logger.error(f"Error procesando respuesta CDX para {domain}: {e}")
             
         return documents
-    
-    def _search_domain_by_years(self, domain: str, query_params: Dict, max_per_domain: int) -> List[Document]:
-        """Búsqueda alternativa dividiendo por años individuales (más confiable)"""
-        logger.info(f"Búsqueda por años para {domain}")
-        
-        start_year = query_params.get('start_year', 1995)
-        end_year = query_params.get('end_year', 2005)
-        
-        all_documents = []
-        years = list(range(start_year, end_year + 1))
-        docs_per_year = max(5, max_per_domain // len(years))
-        
-        logger.info(f"Buscando en {len(years)} años, ~{docs_per_year} docs por año")
-        
-        for year in years:
-            try:
-                # Parámetros más simples y específicos
-                params = {
-                    'url': f'{domain}/*',
-                    'from': f'{year}0101',
-                    'to': f'{year}1231',
-                    'output': 'json',
-                    'fl': 'timestamp,original',  # Solo campos esenciales
-                    'limit': docs_per_year,
-                    'filter': 'statuscode:200'
-                }
-                
-                logger.debug(f"Buscando {domain} en {year}...")
-                response = self._make_request(self.CDX_API, params, timeout=30)
-                
-                if response:
-                    try:
-                        data = response.json()
-                        
-                        # Saltar header
-                        if data and len(data) > 0 and isinstance(data[0], list):
-                            if data[0][0] == 'timestamp':
-                                data = data[1:]
-                        
-                        logger.info(f"  {year}: {len(data)} páginas encontradas")
-                        
-                        for entry in data:
-                            if len(entry) >= 2:
-                                timestamp, original_url = entry[:2]
-                                
-                                # Validar que sea una URL válida
-                                if not original_url or len(original_url) < 10:
-                                    continue
-                                
-                                # Crear documento
-                                try:
-                                    date_obj = datetime.strptime(timestamp[:14], '%Y%m%d%H%M%S')
-                                    identifier = f"{domain}_{timestamp}_{len(all_documents)}"
-                                    
-                                    # Extraer título de URL
-                                    url_parts = original_url.rstrip('/').split('/')
-                                    title = url_parts[-1] if url_parts[-1] else url_parts[-2] if len(url_parts) > 1 else domain
-                                    if '?' in title:
-                                        title = title.split('?')[0]
-                                    if len(title) > 100:
-                                        title = title[:100]
-                                    
-                                    document = Document(identifier, title, date_obj, year)
-                                    document.metadata = {
-                                        'original_url': original_url,
-                                        'wayback_url': f"{self.WAYBACK_BASE}{timestamp}/{original_url}",
-                                        'mimetype': 'text/html',
-                                        'source_api': 'cdx_by_year',
-                                        'domain': domain
-                                    }
-                                    
-                                    # Validar documento
-                                    if self._validate_webpage(document, query_params):
-                                        all_documents.append(document)
-                                        
-                                except ValueError as e:
-                                    logger.debug(f"Error parseando timestamp {timestamp}: {e}")
-                                    continue
-                                except Exception as e:
-                                    logger.debug(f"Error creando documento: {e}")
-                                    continue
-                        
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Error parseando JSON para {year}: {e}")
-                    except Exception as e:
-                        logger.warning(f"Error procesando respuesta para {year}: {e}")
-                else:
-                    logger.warning(f"  {year}: Sin respuesta del servidor")
-                
-                # Rate limiting entre años - más corto
-                time.sleep(self.rate_limit_delay * 0.3)
-                
-                # Si ya tenemos suficientes documentos, parar
-                if len(all_documents) >= max_per_domain:
-                    logger.info(f"Alcanzado límite de {max_per_domain} documentos para {domain}")
-                    break
-                    
-            except Exception as e:
-                logger.warning(f"Error buscando año {year} en {domain}: {e}")
-                continue
-        
-        logger.info(f"✅ Búsqueda completada para {domain}: {len(all_documents)} documentos encontrados")
-        return all_documents[:max_per_domain]
-    
     def _create_document_from_cdx_entry(self, timestamp: str, original_url: str, 
                                        mimetype: str, digest: str) -> Optional[Document]:
         """Crear objeto Document desde entrada CDX"""
@@ -774,73 +536,38 @@ class InternetArchiveClient:
                     url += '&' + urlencode(params)
                 else:
                     url += '?' + urlencode(params)
+                    
 
-            logger.debug(f"Realizando request a: {url}")
+            print(f"Realizando request a: {url}")
 
             response = self.session.get(url, timeout=timeout)
             
-            # T034B: Track consecutive 500 errors
-            if response.status_code == 500:
-                self._consecutive_500_errors += 1
-                logger.warning(f"HTTP 500 error ({self._consecutive_500_errors} consecutive)")
-                
-                # Pause analysis after threshold
-                if self._consecutive_500_errors >= self._error_threshold:
-                    error_msg = f"⚠️ Paused: {self._consecutive_500_errors} consecutive 500 errors from API"
-                    logger.error(error_msg)
-                    
-                    # Call error notification callback if set
-                    if self._error_pause_callback:
-                        self._error_pause_callback(error_msg, self._consecutive_500_errors)
-                    
-                    # Raise exception to halt analysis
-                    raise RuntimeError(f"Analysis paused due to {self._consecutive_500_errors} consecutive API 500 errors. Please retry later.")
-                
-                return None
-            
-            # Reset consecutive error counter on success
-            if response.status_code == 200:
-                self._consecutive_errors = 0
-                self._consecutive_500_errors = 0
-            
             # Manejar códigos de error específicos
             if response.status_code == 429:  # Too Many Requests
-                logger.warning("Rate limit exceeded, esperando más tiempo...")
-                time.sleep(self.rate_limit_delay * 3)
+                logger.warning("Rate limit exceeded, esperando...")
+                time.sleep(self.rate_limit_delay * 2)
                 return self._make_request(url, timeout=timeout)
                 
             elif response.status_code == 503:  # Service Unavailable
-                logger.warning("Servicio no disponible, esperando y reintentando...")
-                time.sleep(self.rate_limit_delay * 2)
-                # Un solo reintento para evitar bucles infinitos
-                try:
-                    response = self.session.get(url, timeout=timeout)
-                    if response.status_code == 200:
-                        self._consecutive_500_errors = 0  # Reset on success
-                        return response
-                except:
-                    pass
-                return None
+                logger.warning("Servicio no disponible, reintentando...")
+                time.sleep(self.rate_limit_delay)
+                return self.session.get(url, timeout=timeout)
                 
             elif response.status_code != 200:
                 logger.warning(f"HTTP {response.status_code} para {url}")
-                self._consecutive_errors += 1
                 return None
                 
             return response
             
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout para {url}")
-            self.failed_requests += 1
             return None
         except requests.exceptions.ConnectionError:
             logger.warning(f"Error de conexión para {url}")
-            self.failed_requests += 1
             time.sleep(self.rate_limit_delay)
             return None
         except Exception as e:
             logger.error(f"Error en request: {e}")
-            self.failed_requests += 1
             return None
             
     def _handle_rate_limiting(self):
@@ -944,31 +671,11 @@ class TextProcessor:
         self.whitespace_pattern = re.compile(r'\s+')
         self.punctuation_pattern = re.compile(f'[{re.escape(string.punctuation)}]')
         
-        # Cache para términos extraídos (legacy - will be replaced by CacheManager)
+        # Cache para términos extraídos
         self._term_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
         
-        # T021: Integrate performance modules if enabled
-        self._use_performance_opts = os.getenv("ENABLE_PERFORMANCE_OPTS", "false").lower() == "true"
-        
-        if self._use_performance_opts:
-            try:
-                from performance.cache_manager import get_cache_manager
-                from performance.worker_pool import get_worker_pool_manager
-                self._cache_manager = get_cache_manager()
-                self._worker_pool_manager = get_worker_pool_manager()
-                logger.info("✅ Performance optimizations enabled (CacheManager + WorkerPoolManager)")
-            except ImportError as e:
-                logger.warning(f"⚠️ Performance modules not available: {e}")
-                self._use_performance_opts = False
-                self._cache_manager = None
-                self._worker_pool_manager = None
-        else:
-            self._cache_manager = None
-            self._worker_pool_manager = None
-        
-    # T019: Add LRU cache for HTML parsing - keep existing decorator
     @lru_cache(maxsize=1000)
     def _clean_and_normalize_text(self, text: str) -> str:
         """Limpiar y normalizar texto usando cache"""
@@ -984,7 +691,6 @@ class TextProcessor:
         
         return text.strip()
         
-    # T020: Enhanced caching for term extraction with CacheManager integration
     def extract_terms(self, text: str) -> List[str]:
         """
         Extraer términos relevantes del texto con optimizaciones
@@ -997,55 +703,30 @@ class TextProcessor:
         """
         if not text:
             return []
+            
+        # Verificar cache
+        text_hash = hash(text[:1000])  # Usar hash de los primeros 1000 caracteres
+        if text_hash in self._term_cache:
+            self._cache_hits += 1
+            return self._term_cache[text_hash]
+            
+        self._cache_misses += 1
         
-        # T020: Use CacheManager if performance opts enabled
-        if self._use_performance_opts and self._cache_manager:
-            import hashlib
-            cache_key = hashlib.sha256(text[:1000].encode()).hexdigest()
+        # Limpiar y normalizar
+        cleaned_text = self._clean_and_normalize_text(text)
+        
+        # Extraer palabras usando regex compilada
+        words = self.word_pattern.findall(cleaned_text)
+        
+        # Filtrar stop words en una sola pasada
+        terms = [word for word in words 
+                if word not in self.STOP_WORDS and len(word) >= 2]
+        
+        # Guardar en cache (limitar tamaño del cache)
+        if len(self._term_cache) < 500:
+            self._term_cache[text_hash] = terms
             
-            # Try cache first
-            cached_terms = self._cache_manager.get(cache_key, "term_extraction")
-            if cached_terms is not None:
-                self._cache_hits += 1
-                return cached_terms
-            
-            self._cache_misses += 1
-            
-            # Extract terms
-            cleaned_text = self._clean_and_normalize_text(text)
-            words = self.word_pattern.findall(cleaned_text)
-            terms = [word for word in words 
-                    if word not in self.STOP_WORDS and len(word) >= 2]
-            
-            # Store in cache
-            terms_size = len(text) + len(terms) * 20  # Approximate size
-            self._cache_manager.put(cache_key, "term_extraction", terms, terms_size)
-            
-            return terms
-        else:
-            # Legacy caching (fallback when performance opts disabled)
-            text_hash = hash(text[:1000])
-            if text_hash in self._term_cache:
-                self._cache_hits += 1
-                return self._term_cache[text_hash]
-                
-            self._cache_misses += 1
-            
-            # Limpiar y normalizar
-            cleaned_text = self._clean_and_normalize_text(text)
-            
-            # Extraer palabras usando regex compilada
-            words = self.word_pattern.findall(cleaned_text)
-            
-            # Filtrar stop words en una sola pasada
-            terms = [word for word in words 
-                    if word not in self.STOP_WORDS and len(word) >= 2]
-            
-            # Guardar en cache (limitar tamaño del cache)
-            if len(self._term_cache) < 500:
-                self._term_cache[text_hash] = terms
-                
-            return terms
+        return terms
         
     def _process_document_batch(self, documents: List) -> Dict[str, int]:
         """Procesar un lote de documentos y retornar frecuencias"""
@@ -1097,74 +778,35 @@ class TextProcessor:
         return {}
         
     def _calculate_frequencies_parallel(self, documents: List) -> Dict[str, int]:
-        """
-        T024-T026: Calcular frecuencias usando WorkerPoolManager con dynamic workers
-        """
-        # T023: Use dynamic worker pool if performance opts enabled
-        if self._use_performance_opts and self._worker_pool_manager:
-            # T026: Use CPU-bound pool for text processing operations
-            worker_pool = self._worker_pool_manager.create_pool("cpu_bound", len(documents))
-            logger.info(f"✅ Usando WorkerPoolManager dinámico con {worker_pool.max_workers} workers (CPU-bound)")
+        """Calcular frecuencias usando procesamiento paralelo"""
+        logger.info(f"Usando procesamiento paralelo con {self.max_workers} workers")
+        
+        # Dividir documentos en lotes
+        batch_size = max(1, len(documents) // self.max_workers)
+        document_batches = [documents[i:i + batch_size] 
+                           for i in range(0, len(documents), batch_size)]
+        
+        # Procesar lotes en paralelo
+        combined_frequencies = defaultdict(int)
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Enviar lotes a procesar
+            future_to_batch = {
+                executor.submit(self._process_document_batch, batch): batch 
+                for batch in document_batches
+            }
             
-            # Dividir documentos en lotes
-            batch_size = max(1, len(documents) // worker_pool.max_workers)
-            document_batches = [documents[i:i + batch_size] 
-                               for i in range(0, len(documents), batch_size)]
-            
-            # Procesar lotes en paralelo usando WorkerPoolManager
-            combined_frequencies = defaultdict(int)
-            
-            try:
-                # Submit tasks to worker pool
-                futures = [
-                    self._worker_pool_manager.submit_task(worker_pool, self._process_document_batch, batch)
-                    for batch in document_batches
-                ]
-                
-                # Recopilar resultados
-                for future in as_completed(futures):
-                    try:
-                        batch_freq = future.result()
-                        for term, freq in batch_freq.items():
-                            combined_frequencies[term] += freq
-                    except Exception as e:
-                        logger.error(f"Error procesando lote: {e}")
-            finally:
-                # Cleanup worker pool
-                self._worker_pool_manager.shutdown(worker_pool, wait=True)
+            # Recopilar resultados
+            for future in as_completed(future_to_batch):
+                try:
+                    batch_freq = future.result()
+                    for term, freq in batch_freq.items():
+                        combined_frequencies[term] += freq
+                except Exception as e:
+                    logger.error(f"Error procesando lote: {e}")
                     
-            logger.info(f"Procesamiento paralelo completado. Términos únicos: {len(combined_frequencies)}")
-            return dict(combined_frequencies)
-        else:
-            # Legacy ThreadPoolExecutor (fallback)
-            logger.info(f"Usando procesamiento paralelo con {self.max_workers} workers (legacy)")
-            
-            # Dividir documentos en lotes
-            batch_size = max(1, len(documents) // self.max_workers)
-            document_batches = [documents[i:i + batch_size] 
-                               for i in range(0, len(documents), batch_size)]
-            
-            # Procesar lotes en paralelo
-            combined_frequencies = defaultdict(int)
-            
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                # Enviar lotes a procesar
-                future_to_batch = {
-                    executor.submit(self._process_document_batch, batch): batch 
-                    for batch in document_batches
-                }
-                
-                # Recopilar resultados
-                for future in as_completed(future_to_batch):
-                    try:
-                        batch_freq = future.result()
-                        for term, freq in batch_freq.items():
-                            combined_frequencies[term] += freq
-                    except Exception as e:
-                        logger.error(f"Error procesando lote: {e}")
-                        
-            logger.info(f"Procesamiento paralelo completado. Términos únicos: {len(combined_frequencies)}")
-            return dict(combined_frequencies)
+        logger.info(f"Procesamiento paralelo completado. Términos únicos: {len(combined_frequencies)}")
+        return dict(combined_frequencies)
         
     def _calculate_frequencies_sequential(self, documents: List) -> Dict[str, int]:
         """Calcular frecuencias secuencialmente"""
@@ -1179,35 +821,16 @@ class TextProcessor:
         return dict(Counter(all_terms))
         
     def get_cache_stats(self) -> Dict:
-        """
-        T022: Obtener estadísticas del cache con soporte para CacheManager
-        """
-        # T022: Return CacheManager statistics if performance opts enabled
-        if self._use_performance_opts and self._cache_manager:
-            cache_stats = self._cache_manager.get_statistics()
-            # Merge with legacy stats for compatibility
-            total_requests = self._cache_hits + self._cache_misses
-            hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
-            
-            return {
-                'cache_hits': cache_stats.get('hit_count', self._cache_hits),
-                'cache_misses': cache_stats.get('miss_count', self._cache_misses),
-                'hit_rate_percent': cache_stats.get('hit_rate_percent', round(hit_rate, 2)),
-                'cache_size': cache_stats.get('total_entries', len(self._term_cache)),
-                'cache_size_mb': cache_stats.get('total_size_mb', 0),
-                'by_type': cache_stats.get('by_type', {})
-            }
-        else:
-            # Legacy cache statistics
-            total_requests = self._cache_hits + self._cache_misses
-            hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
-            
-            return {
-                'cache_hits': self._cache_hits,
-                'cache_misses': self._cache_misses,
-                'hit_rate_percent': round(hit_rate, 2),
-                'cache_size': len(self._term_cache)
-            }
+        """Obtener estadísticas del cache"""
+        total_requests = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / total_requests * 100) if total_requests > 0 else 0
+        
+        return {
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate_percent': round(hit_rate, 2),
+            'cache_size': len(self._term_cache)
+        }
         
     def get_top_terms(self, frequencies: Dict[str, int], top_n: int = 50) -> List[tuple]:
         """
@@ -1349,58 +972,25 @@ class HistoricalTermAnalyzer:
     Orquestador principal del sistema de análisis histórico de términos
     """
     
-    def __init__(self, rate_limit_delay: float = 1.0, progress_callback=None):
+    def __init__(self, rate_limit_delay: float = 1.0):
         """
         Inicializar analizador histórico
         
         Args:
             rate_limit_delay: Delay entre requests a Internet Archive
-            progress_callback: Función callback para reportar progreso (opcional)
         """
         self.client = InternetArchiveClient(rate_limit_delay)
         self.processor = TextProcessor()
         self.memory = SessionMemory()
         self.exporter = Exporter()
         self.visualizer = Visualizer()
-        self.progress_callback = progress_callback
         
-        # T030-T033: Initialize performance monitor if enabled
-        self._use_perf_monitoring = os.getenv("ENABLE_PERF_MONITORING", "false").lower() == "true"
-        if self._use_perf_monitoring:
-            try:
-                from performance import get_monitor
-                import uuid
-                self._analysis_id = str(uuid.uuid4())
-                self._perf_monitor = get_monitor(self._analysis_id)
-                logger.info(f"✅ Performance monitoring enabled (analysis_id: {self._analysis_id})")
-            except ImportError as e:
-                logger.warning(f"⚠️ Performance monitoring not available: {e}")
-                self._use_perf_monitoring = False
-                self._perf_monitor = None
-        else:
-            self._perf_monitor = None
-        
-        # T041: Initialize memory profiler if enabled
-        self._use_memory_profiling = os.getenv("ENABLE_PERF_MONITORING", "false").lower() == "true"
-        if self._use_memory_profiling:
-            try:
-                from performance.memory_profiler import get_memory_profiler
-                self._memory_profiler = get_memory_profiler()
-                logger.info(f"✅ Memory profiling enabled (baseline: {self._memory_profiler.get_current_usage():.1f}MB)")
-            except ImportError as e:
-                logger.warning(f"⚠️ Memory profiling not available: {e}")
-                self._use_memory_profiling = False
-                self._memory_profiler = None
-        else:
-            self._memory_profiler = None
-    
     def analyze_period(self, 
                       start_year: int, 
                       end_year: int, 
                       max_documents: int = 600,
                       domains: Optional[List[str]] = None,
-                      search_terms: Optional[List[str]] = None,
-                      analyze_by_year: bool = False) -> Dict:
+                      search_terms: Optional[List[str]] = None) -> Dict:
         """
         Analizar términos en páginas web de un período histórico específico
         
@@ -1410,7 +1000,6 @@ class HistoricalTermAnalyzer:
             max_documents: Número máximo de páginas web a analizar
             domains: Lista de dominios a buscar (opcional, usa lista por defecto)
             search_terms: Términos específicos a buscar (opcional)
-            analyze_by_year: Si True, genera resultados separados por año
             
         Returns:
             Diccionario con resultados del análisis
@@ -1428,168 +1017,42 @@ class HistoricalTermAnalyzer:
         }
         
         try:
-            # T030: Paso 1: Búsqueda de documentos (10% del progreso)
-            search_phase_id = None
-            if self._use_perf_monitoring and self._perf_monitor:
-                search_phase_id = self._perf_monitor.start_phase("search")
-            
-            if self.progress_callback:
-                self.progress_callback(5, "Buscando páginas web en Internet Archive...")
-            
-            documents = self.client.search_items(query_params, max_results=max_documents)
-            
-            if self._use_perf_monitoring and self._perf_monitor and search_phase_id:
-                search_duration = self._perf_monitor.end_phase(search_phase_id)
-                logger.info(f"⏱️ Search phase completed in {search_duration:.2f}s")
-                
-                # T041: Record memory usage at phase boundary
-                if self._use_memory_profiling and self._memory_profiler:
-                    mem_mb = self._memory_profiler.get_current_usage()
-                    self._perf_monitor.record_metric("memory_usage", mem_mb, "MB", "search")
-                    logger.debug(f"💾 Memory after search: {mem_mb:.1f}MB")
+            # Fase 1: Búsqueda de documentos
+            logger.info("Fase 1: Búsqueda de documentos...")
+            documents = self.client.search_items(query_params, max_documents)
             
             if not documents:
-                return {'error': 'No se encontraron páginas web para los criterios especificados'}
-            
-            if self.progress_callback:
-                self.progress_callback(10, f"Encontradas {len(documents)} páginas web")
-            
+                logger.error("No se encontraron documentos")
+                return {'error': 'No se encontraron documentos'}
+                
             self.memory.add_documents(documents)
             
-            # T031: Paso 2: Descarga de contenido (10% - 70% del progreso)
-            download_phase_id = None
-            if self._use_perf_monitoring and self._perf_monitor:
-                download_phase_id = self._perf_monitor.start_phase("download")
-            
-            if self.progress_callback:
-                self.progress_callback(15, "Iniciando descarga de contenido...")
-            
+            # Fase 2: Descarga de contenido
+            logger.info("Fase 2: Descarga de contenido textual...")
             self._download_document_content(documents)
             
-            if self._use_perf_monitoring and self._perf_monitor and download_phase_id:
-                download_duration = self._perf_monitor.end_phase(download_phase_id)
-                logger.info(f"⏱️ Download phase completed in {download_duration:.2f}s")
-                
-                # T041: Record memory usage at phase boundary
-                if self._use_memory_profiling and self._memory_profiler:
-                    mem_mb = self._memory_profiler.get_current_usage()
-                    self._perf_monitor.record_metric("memory_usage", mem_mb, "MB", "download")
-                    logger.debug(f"💾 Memory after download: {mem_mb:.1f}MB")
-            
-            # Filtrar documentos con contenido
-            docs_with_content = [d for d in documents if d.text_content]
-            
-            if not docs_with_content:
-                return {'error': 'No se pudo extraer contenido de ninguna página web'}
-            
-            if self.progress_callback:
-                self.progress_callback(75, f"{len(docs_with_content)} páginas con contenido válido")
-            
-            # T032: Paso 3: Procesamiento de términos (70% - 90% del progreso)
-            analyze_phase_id = None
-            if self._use_perf_monitoring and self._perf_monitor:
-                analyze_phase_id = self._perf_monitor.start_phase("analyze")
-            
-            if self.progress_callback:
-                self.progress_callback(80, "Procesando y contando términos...")
-            
-            # Análisis agregado
-            frequencies = self.processor.calculate_frequencies(docs_with_content)
-            top_terms = self.processor.get_top_terms(frequencies, top_n=50)
-            
-            if self._use_perf_monitoring and self._perf_monitor and analyze_phase_id:
-                analyze_duration = self._perf_monitor.end_phase(analyze_phase_id)
-                logger.info(f"⏱️ Analyze phase completed in {analyze_duration:.2f}s")
-                
-                # T041: Record memory usage at phase boundary
-                if self._use_memory_profiling and self._memory_profiler:
-                    mem_mb = self._memory_profiler.get_current_usage()
-                    self._perf_monitor.record_metric("memory_usage", mem_mb, "MB", "analyze")
-                    logger.debug(f"💾 Memory after analyze: {mem_mb:.1f}MB")
-            
+            # Fase 3: Análisis de frecuencias
+            logger.info("Fase 3: Análisis de frecuencias...")
+            frequencies = self.processor.calculate_frequencies(documents)
             self.memory.set_frequencies(frequencies)
+            
+            # Fase 4: Obtener términos principales
+            top_terms = self.processor.get_top_terms(frequencies, top_n=100)
             self.memory.set_top_terms(top_terms)
             
-            # Análisis por año si se solicita
-            results_by_year = {}
-            if analyze_by_year:
-                if self.progress_callback:
-                    self.progress_callback(85, "Generando análisis por año...")
-                results_by_year = self._analyze_by_year(docs_with_content)
-            
-            # Paso 4: Generar estadísticas (90% - 95% del progreso)
-            if self.progress_callback:
-                self.progress_callback(90, "Generando estadísticas...")
-            
+            # Actualizar estadísticas
             client_stats = self.client.get_stats()
-            processor_stats = self.processor.get_cache_stats() if hasattr(self.processor, 'get_cache_stats') else {}
+            self.memory.update_stats(client_stats)
             
-            self.memory.update_stats({
-                'client_stats': client_stats,
-                'processor_stats': processor_stats
-            })
-            
-            # Paso 5: Generar resultados finales (95% - 100%)
-            if self.progress_callback:
-                self.progress_callback(95, "Finalizando análisis...")
-            
+            # Generar resultados
             results = self._generate_results()
-            
-            # Agregar resultados por año si se generaron
-            if results_by_year:
-                results['results_by_year'] = results_by_year
-            
-            if self.progress_callback:
-                self.progress_callback(100, "¡Análisis completado!")
-            
-            # T038-T039: Cleanup and garbage collection after analysis
-            self._cleanup_analysis_memory(docs_with_content)
             
             logger.info("Análisis completado exitosamente")
             return results
             
         except Exception as e:
-            error_msg = f"Error durante el análisis: {str(e)}"
-            logger.error(error_msg)
-            if self.progress_callback:
-                self.progress_callback(0, f"Error: {str(e)}")
-            return {'error': error_msg}
-    
-    def _analyze_by_year(self, documents: List[Document]) -> Dict:
-        """
-        Analizar términos separadamente para cada año
-        
-        Args:
-            documents: Lista de documentos con contenido
-            
-        Returns:
-            Diccionario con resultados por año {año: {frequencies, top_terms}}
-        """
-        results_by_year = {}
-        
-        # Agrupar documentos por año
-        docs_by_year = defaultdict(list)
-        for doc in documents:
-            if doc.year:
-                docs_by_year[doc.year].append(doc)
-        
-        # Analizar cada año
-        for year in sorted(docs_by_year.keys()):
-            year_docs = docs_by_year[year]
-            
-            # Calcular frecuencias para este año
-            frequencies = self.processor.calculate_frequencies(year_docs)
-            top_terms = self.processor.get_top_terms(frequencies, top_n=50)
-            
-            results_by_year[year] = {
-                'frequencies': frequencies,
-                'top_terms': top_terms,
-                'document_count': len(year_docs)
-            }
-            
-            logger.info(f"Año {year}: {len(year_docs)} documentos, {len(frequencies)} términos únicos")
-        
-        return results_by_year
+            logger.error(f"Error en análisis: {e}")
+            return {'error': str(e)}
             
     def _download_document_content(self, documents: List[Document]):
         """Descargar contenido textual para todas las páginas web con paralelización optimizada"""
@@ -1602,13 +1065,6 @@ class HistoricalTermAnalyzer:
         # Usar paralelización para downloads de red
         max_workers = min(8, total_docs)  # Máximo 8 workers para evitar sobrecargar el servidor
         
-        # T034A: Variables para tracking de progreso no bloqueante
-        # Update every 5 seconds OR every 10 pages (whichever comes first)
-        completed_docs = 0
-        progress_step = min(10, max(1, total_docs // 60))  # At least every 10 pages
-        last_update_time = time.time()
-        update_interval = 5.0  # 5 seconds
-        
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Enviar todas las tareas de descarga
             future_to_doc = {
@@ -1616,40 +1072,25 @@ class HistoricalTermAnalyzer:
                 for doc in documents
             }
             
-            # Procesar resultados a medida que se completan
-            for future in as_completed(future_to_doc):
+            # Procesar resultados conforme se completan
+            for i, future in enumerate(as_completed(future_to_doc), 1):
                 doc = future_to_doc[future]
-                completed_docs += 1
                 
                 try:
-                    success = future.result()
+                    success = future.result(timeout=60)  # Timeout de 60 segundos por documento
                     if success:
                         successful_downloads += 1
-                    
-                    # T034A: Non-blocking progress updates
-                    # Update every 5 seconds OR every 10 pages (whichever comes first)
-                    current_time = time.time()
-                    time_elapsed = current_time - last_update_time
-                    
-                    should_update = (
-                        (completed_docs % progress_step == 0) or  # Every 10 pages
-                        (time_elapsed >= update_interval)  # Every 5 seconds
-                    )
-                    
-                    if self.progress_callback and should_update:
-                        progress_percent = 15 + int((completed_docs / total_docs) * 60)
-                        self.progress_callback(
-                            progress_percent, 
-                            f"Descargando: {completed_docs}/{total_docs} páginas ({successful_downloads} exitosas)"
-                        )
-                        last_update_time = current_time  # Reset timer
+                        logger.debug(f"Contenido descargado: {doc.identifier}")
+                    else:
+                        logger.warning(f"No se pudo obtener contenido para {doc.identifier}")
                         
                 except Exception as e:
-                    logger.error(f"Error procesando resultado de descarga: {e}")
-        
-        # Reporte final de descarga
-        if self.progress_callback:
-            self.progress_callback(75, f"Descarga completada: {successful_downloads}/{total_docs} páginas exitosas")
+                    logger.error(f"Error descargando {doc.identifier}: {e}")
+                    continue
+                
+                # Log de progreso cada 10 documentos
+                if i % 10 == 0:
+                    logger.info(f"Progreso: {i}/{total_docs} páginas procesadas")
                     
         logger.info(f"Descarga paralela completada: {successful_downloads}/{total_docs} exitosos")
     
@@ -1669,40 +1110,6 @@ class HistoricalTermAnalyzer:
         except Exception as e:
             logger.debug(f"Error en descarga individual de {doc.identifier}: {e}")
             return False
-    
-    def _cleanup_analysis_memory(self, documents: List[Document]):
-        """
-        T038-T039: Clean up memory after analysis completion.
-        
-        Clears intermediate data structures and triggers garbage collection
-        to ensure memory is released properly.
-        
-        Args:
-            documents: Document list to clear content from
-        """
-        import gc
-        
-        logger.debug("Starting memory cleanup...")
-        
-        # T039: Clear intermediate data structures
-        # Clear document content (keep metadata for results)
-        for doc in documents:
-            if hasattr(doc, 'text_content'):
-                doc.text_content = None
-        
-        # Clear any cached HTML content
-        if hasattr(self.client, '_html_cache'):
-            self.client._html_cache = {}
-        
-        # Clear processor caches if they exist
-        if hasattr(self.processor, '_term_cache'):
-            self.processor._term_cache = {}
-        
-        # T038: Force garbage collection (two passes for cyclic references)
-        collected = gc.collect()
-        gc.collect()  # Second pass for cyclic references
-        
-        logger.debug(f"Memory cleanup complete (collected {collected} objects)")
         
     def _generate_results(self) -> Dict:
         """Generar diccionario de resultados completos"""

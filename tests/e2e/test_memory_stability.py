@@ -2,6 +2,7 @@
 E2E UI responsiveness test for memory stability (User Story 2)
 """
 import pytest
+import time
 from playwright.sync_api import Page, expect
 
 class TestMemoryStability:
@@ -14,7 +15,7 @@ class TestMemoryStability:
             page.locator("input[aria-label='Search term']").fill("climate change")
             page.locator("input[aria-label='Number of pages']").fill("10")
             page.locator("button:has-text('Analyze')").click()
-            expect(page.locator("text=Analysis complete")).to_be_visible(timeout=60000)
+            expect(page.locator("[data-testid='analysis-complete']")).to_be_visible(timeout=60000)
         # Switch tabs and measure responsiveness
         for i in range(10):
             tab = page.locator(f"button:has-text('Analysis {i+1}')")

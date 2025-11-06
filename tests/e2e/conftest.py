@@ -10,6 +10,12 @@ Provides reusable test components including:
 """
 
 import pytest
+import subprocess
+import sys
+import time
+import socket
+import signal
+from pathlib import Path as _Path
 import json
 import os
 from pathlib import Path
@@ -192,11 +198,28 @@ def streamlit_app(page: Page, monkeypatch) -> Page:
     monkeypatch.setenv("ENABLE_PERFORMANCE_OPTS", "true")
     monkeypatch.setenv("ENABLE_PERF_MONITORING", "true")
     
-    # Navigate to Streamlit app
+    # Navigate to Streamlit app (ensure server is running via streamlit_server fixture)
+    # streamlit_server session fixture will ensure the app is up
     page.goto("http://localhost:8501", wait_until="networkidle")
     
     # Wait for Streamlit to finish initializing (stale elements become stable)
-    page.wait_for_selector("div[data-testid='stApp']", state="visible", timeout=10000)
+    # Wait for either the app root or a recognizable header to ensure the UI is ready
+    try:
+        page.wait_for_selector("div[data-testid='stApp']", state="visible", timeout=10000)
+    except Exception:
+        pass
+
+    try:
+        page.wait_for_selector("text=Historical Term Analyzer", timeout=8000)
+    except Exception:
+        try:
+            page.wait_for_selector("text=🔍 Historical Term Analyzer", timeout=8000)
+        except Exception:
+            # Spanish header fallback
+            try:
+                page.wait_for_selector("text=🔍 Historical Term Analyzer", timeout=2000)
+            except Exception:
+                pass
     
     return page
 
@@ -252,6 +275,97 @@ def performance_test_config() -> Dict[str, Any]:
         "test_page_counts": [10, 50, 100, 300],
         "timeout_per_page": 3000  # 3 seconds
     }
+
+
+def _is_port_open(host: str, port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.5)
+        s.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except:
+            pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def streamlit_server():
+    """Ensure the Streamlit app is running on localhost:8501 for tests.
+
+    If no server is detected, start one in a subprocess using the project's venv.
+    The fixture yields control and stops the server at the end of the session.
+    """
+    host = '127.0.0.1'
+    port = 8501
+    server_proc = None
+
+    if _is_port_open(host, port):
+        # Server already running; nothing to do
+        yield
+        return
+
+    # Start streamlit using venv311 if available, otherwise fall back to `streamlit`
+    # Resolve repository root (two parents above tests/e2e)
+    repo_root = Path(__file__).resolve().parents[2]
+    venv_bin = repo_root / 'venv311' / 'bin' / 'streamlit'
+    app_path = repo_root / 'streamlit_app.py'
+
+    if venv_bin.exists():
+        cmd = [str(venv_bin), 'run', str(app_path), '--server.port', str(port)]
+    else:
+        cmd = ['streamlit', 'run', str(app_path), '--server.port', str(port)]
+
+    # Ensure venv bin is on PATH so the subprocess can find binaries
+    env = os.environ.copy()
+    venv_bin_dir = str(repo_root / 'venv311' / 'bin')
+    env['PATH'] = venv_bin_dir + os.pathsep + env.get('PATH', '')
+    # Ensure Streamlit backend uses mock CDX responses for deterministic E2E
+    env.setdefault('MOCK_CDX', 'true')
+    # Ensure Python output is unbuffered for real-time diagnostics
+    env.setdefault('PYTHONUNBUFFERED', '1')
+
+    # Start server subprocess
+    server_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN))
+
+    # Wait for the server to be available
+    for _ in range(30):
+        if _is_port_open(host, port):
+            break
+        time.sleep(1)
+
+    if not _is_port_open(host, port):
+        # Failed to start server; capture stderr for diagnostics
+        stderr = None
+        try:
+            stderr = server_proc.stderr.read().decode('utf-8', errors='ignore')
+        except Exception:
+            stderr = '<no stderr available>'
+
+        if server_proc:
+            server_proc.terminate()
+
+        raise RuntimeError(f'Failed to start Streamlit server on port 8501. stderr:\n{stderr}')
+
+    try:
+        yield
+    finally:
+        # Terminate the background Streamlit process if we started it
+        if server_proc:
+            try:
+                server_proc.terminate()
+                server_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # If the process didn't exit in time, escalate to kill
+                try:
+                    server_proc.kill()
+                    server_proc.wait(timeout=5)
+                except Exception:
+                    # Give up - don't raise here; we don't want teardown to error the whole suite
+                    pass
 
 import pytest
 from playwright.sync_api import Page

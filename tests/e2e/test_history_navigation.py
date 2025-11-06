@@ -48,6 +48,10 @@ def test_switch_between_analyses(page: Page, app_url: str):
     summary1 = get_analysis_summary(page)
     summaries.append(('2020', summary1))
     
+    # Reload page to ensure fresh state for second analysis
+    page.reload(wait_until='networkidle')
+    page.wait_for_timeout(2000)
+    
     # Run second analysis (2021)
     configure_analysis(
         page,
@@ -57,14 +61,37 @@ def test_switch_between_analyses(page: Page, app_url: str):
         domains=['clarin.com']
     )
     
+    # Debug: take screenshot to verify year was set correctly
+    page.screenshot(path='tests/screenshots/before_second_analysis.png')
+    print("Configured second analysis for year 2021")
+    
     assert start_analysis(page), "Failed to start second analysis"
     assert wait_for_analysis_complete(page, timeout=120000), "Second analysis timeout"
+    
+    # Wait for UI to update with new results AND for metrics to refresh
+    # This is critical because Streamlit may still be showing the first analysis results
+    page.wait_for_timeout(2000)
+    
+    # Wait for the new top term marker to appear (should be mock_year_2021)
+    try:
+        page.wait_for_selector('text=/mock_year_2021/', timeout=10000)
+        print("✅ Found mock_year_2021 marker in page")
+    except Exception:
+        print("⚠️ Did not find mock_year_2021 marker - analysis may not have used correct year")
+        # Take another screenshot for debugging
+        page.screenshot(path='tests/screenshots/after_second_analysis.png')
     
     summary2 = get_analysis_summary(page)
     summaries.append(('2021', summary2))
     
+    # Debug: print both summaries
+    print(f"Summary 1 (2020): {summary1}")
+    print(f"Summary 2 (2021): {summary2}")
+    
     # Verify both analyses completed with different data
-    assert summary1 != summary2, "Analyses produced identical results (unexpected)"
+    # The key difference should be the top_term which has the synthetic marker
+    assert summary1['top_term'] != summary2['top_term'], \
+        f"Top terms are identical (expected different year markers): '{summary1['top_term']}' vs '{summary2['top_term']}'"
     
     # Look for history navigation UI
     # Check sidebar for history selector or analysis tabs
