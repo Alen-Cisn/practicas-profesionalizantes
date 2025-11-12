@@ -83,7 +83,6 @@ class InternetArchiveClient:
     # URLs base de Internet Archive - enfoque en Wayback Machine
     CDX_API = "http://web.archive.org/cdx/search/cdx"
     WAYBACK_BASE = "http://web.archive.org/web/"
-    AVAILABILITY_API = "http://archive.org/wayback/available"
     
     # Dominios populares para búsqueda de páginas web
     POPULAR_DOMAINS = [
@@ -169,19 +168,19 @@ class InternetArchiveClient:
         
         # Parámetros para CDX API - optimizados para mejor respuesta
         params = {
-            'url': f'{domain}/*',
+            'url': f'{domain}',
             'from': f'{start_year}0101',
             'to': f'{end_year}1231',
             'output': 'json',
-            'fl': 'timestamp,original,mimetype,statuscode,digest',
-            'filter': 'statuscode:200',
-            'filter': 'mimetype:text/html',
+            # 'fl': 'timestamp,original,mimetype,statuscode,digest',
+            # 'filter': 'statuscode:200',
+            # 'filter': 'mimetype:text/html',
             'collapse': 'urlkey',  # Mejor que digest para evitar duplicados
-            'limit': min(max_per_domain, 1000)  # Limitar requests grandes
+            # 'limit': min(max_per_domain, 1000)  # Limitar requests grandes
         }
         
         # Usar timeout más largo para CDX API
-        response = self._make_request(self.CDX_API, params, timeout=60)
+        response = self._make_request(self.CDX_API, params, limit=min(max_per_domain, 1000), timeout=90)
         if not response:
             return []
             
@@ -229,18 +228,18 @@ class InternetArchiveClient:
             try:
                 # Parámetros más simples y específicos
                 params = {
-                    'url': f'{domain}/*',
+                    'url': f'{domain}',
                     'from': f'{year}0101',
                     'to': f'{year}1231',
                     'output': 'json',
-                    'fl': 'timestamp,original',  # Solo campos esenciales
-                    'limit': docs_per_year,
-                    'filter': 'statuscode:200'
+                    # 'fl': 'timestamp,original',  # Solo campos esenciales
+                    # 'limit': docs_per_year,
+                    # 'filter': 'statuscode:200'
                 }
                 
                 logger.debug(f"Buscando {domain} en {year}...")
-                response = self._make_request(self.CDX_API, params, timeout=30)
-                
+                response = self._make_request(self.CDX_API, params, limit=docs_per_year, timeout=90)
+
                 if response:
                     try:
                         data = response.json()
@@ -253,9 +252,12 @@ class InternetArchiveClient:
                         logger.info(f"  {year}: {len(data)} páginas encontradas")
                         
                         for entry in data:
-                            if len(entry) >= 2:
-                                timestamp, original_url = entry[:2]
-                                
+                            logger.info(f"    Procesando entrada: {entry}")
+                            if len(entry) >= 5:
+                                _, timestamp, original_url, _, _ = entry[:5]
+
+                                logger.info(f"    Campos: {timestamp}, {original_url}")
+
                                 # Validar que sea una URL válida
                                 if not original_url or len(original_url) < 10:
                                     continue
@@ -264,7 +266,7 @@ class InternetArchiveClient:
                                 try:
                                     date_obj = datetime.strptime(timestamp[:14], '%Y%m%d%H%M%S')
                                     identifier = f"{domain}_{timestamp}_{len(all_documents)}"
-                                    
+
                                     # Extraer título de URL
                                     url_parts = original_url.rstrip('/').split('/')
                                     title = url_parts[-1] if url_parts[-1] else url_parts[-2] if len(url_parts) > 1 else domain
@@ -449,7 +451,7 @@ class InternetArchiveClient:
         logger.debug(f"Descargando página: {wayback_url}")
         
         try:
-            response = self._make_request(wayback_url, timeout=30)
+            response = self._make_request(wayback_url, timeout=90)
             if response and response.status_code == 200:
                 # Extraer texto del HTML
                 html_content = response.text
@@ -636,8 +638,8 @@ class InternetArchiveClient:
         cleaned_lines = [line.strip() for line in lines if len(line.strip()) > 20]
         
         return '\n'.join(cleaned_lines)
-        
-    def _make_request(self, url: str, params: Dict = None, timeout: int = 30) -> Optional[requests.Response]:
+
+    def _make_request(self, url: str, params: Dict = None, limit: int = 100, timeout: int = 90) -> Optional[requests.Response]:
         """Realizar request HTTP con manejo de errores y rate limiting"""
         
         self.total_requests += 1
@@ -717,6 +719,7 @@ class TextProcessor:
     STOP_WORDS = {
         # Artículos, preposiciones y conjunciones básicas
         'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 
+        'cnn', 'nyt', 'york'
         'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the', 'to', 'was',
         'will', 'with', 'this', 'but', 'they', 'have', 'had', 'what', 'said', 
         'each', 'which', 'do', 'how', 'their', 'if', 'up', 'out', 'many',
@@ -1297,7 +1300,7 @@ class HistoricalTermAnalyzer:
                         progress_percent = 15 + int((completed_docs / total_docs) * 60)
                         self.progress_callback(
                             progress_percent, 
-                            f"Descargando: {completed_docs}/{total_docs} páginas ({successful_downloads} exitosas)"
+                            f"Descargando: {completed_docs}/{total_docs} páginas"
                         )
                         
                 except Exception as e:
