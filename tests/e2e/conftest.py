@@ -14,12 +14,15 @@ from playwright.sync_api import Page, Browser, BrowserContext, expect
 from typing import Generator
 import os
 import signal
+import sys
+import platform
 
 
 # Test configuration
 STREAMLIT_URL = "http://localhost:8501"
 STREAMLIT_TIMEOUT = 30000  # 30 seconds
 APP_STARTUP_TIMEOUT = 10  # 10 seconds to start the app
+IS_WINDOWS = platform.system() == "Windows"
 
 
 @pytest.fixture(scope="session")
@@ -29,16 +32,25 @@ def streamlit_app():
     This fixture runs once per test session.
     """
     # Get the path to streamlit executable in the virtual environment
-    import sys
     streamlit_path = os.path.join(os.path.dirname(sys.executable), "streamlit")
     
-    # Start Streamlit app
-    process = subprocess.Popen(
-        [streamlit_path, "run", "streamlit_app.py", "--server.headless", "true"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid  # Create new process group for proper cleanup
-    )
+    # Start Streamlit app with platform-specific process group handling
+    if IS_WINDOWS:
+        # On Windows, create new process group
+        process = subprocess.Popen(
+            [streamlit_path, "run", "streamlit_app.py", "--server.headless", "true"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        # On Unix, create new process group for proper cleanup
+        process = subprocess.Popen(
+            [streamlit_path, "run", "streamlit_app.py", "--server.headless", "true"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid  # type: ignore
+        )
     
     # Wait for the app to be ready
     max_attempts = 20
@@ -53,15 +65,35 @@ def streamlit_app():
                 time.sleep(1)
             else:
                 # Kill the process if it didn't start
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                _terminate_process(process)
                 raise RuntimeError("Failed to start Streamlit app")
     
     yield STREAMLIT_URL
     
     # Cleanup: Stop the Streamlit app
     print("\n🛑 Stopping Streamlit app...")
-    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    process.wait(timeout=5)
+    _terminate_process(process)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def _terminate_process(process):
+    """Terminate a process in a cross-platform way."""
+    if IS_WINDOWS:
+        # On Windows, use terminate() which sends CTRL_BREAK_EVENT to process group
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+    else:
+        # On Unix, kill the process group
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)  # type: ignore
+        except ProcessLookupError:
+            pass  # Process already terminated
 
 
 @pytest.fixture
@@ -189,21 +221,19 @@ def move_streamlit_slider(page: Page, label: str, value: int):
         label: The label of the slider
         value: The value to set
     """
-    # Find the slider input
-    slider_input = page.locator(f'label:has-text("{label}") + div input[type="range"]')
+    # Find the slider using aria-label attribute (Streamlit sets this)
+    slider_locator = page.locator(f'input[type="range"][aria-label="{label}"]')
     
-    # Set the value using JavaScript (more reliable than dragging)
-    page.evaluate(
-        f"""
-        (value) => {{
-            const slider = document.querySelector('label:has-text("{label}") + div input[type="range"]');
-            if (slider) {{
-                slider.value = value;
-                slider.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                slider.dispatchEvent(new Event('change', {{ bubbles: true }}));
-            }}
-        }}
-        """,
+    # Wait for slider to be available
+    slider_locator.wait_for(state="visible", timeout=5000)
+    
+    # Set the value using the locator's evaluate method
+    slider_locator.evaluate(
+        """(element, value) => {
+            element.value = value;
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+        }""",
         value
     )
     page.wait_for_timeout(300)
@@ -245,7 +275,7 @@ def get_metric_value(page: Page, metric_label: str) -> str:
     """
     metric = page.locator(f'[data-testid="stMetric"]:has-text("{metric_label}")')
     value = metric.locator('[data-testid="stMetricValue"]').text_content()
-    return value.strip()
+    return value.strip() if value else ""
 
 
 def take_screenshot(page: Page, name: str):

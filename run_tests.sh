@@ -8,13 +8,20 @@ echo "🧪 Historical Term Analyzer - E2E Test Runner"
 echo "=============================================="
 
 # Check if virtual environment exists
-if [ ! -d "venv311" ]; then
+if [ ! -d "venv" ]; then
     echo "⚠️  Virtual environment not found. Creating one..."
-    python3.11 -m venv venv311
+    python -m venv venv
 fi
 
-# Activate virtual environment
-source venv311/bin/activate
+# Activate virtual environment (handle both Unix and Windows paths)
+if [ -f "venv/Scripts/activate" ]; then
+    source venv/Scripts/activate
+elif [ -f "venv/bin/activate" ]; then
+    source venv/bin/activate
+else
+    echo "❌ Cannot find virtual environment activation script"
+    exit 1
+fi
 
 # Check if playwright is installed
 if ! python -c "import playwright" 2>/dev/null; then
@@ -30,6 +37,7 @@ TEST_PATH="tests/e2e/"
 PYTEST_ARGS="-v"
 BROWSER="chromium"
 HEADED=""
+MARKER=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -42,11 +50,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --smoke)
-            PYTEST_ARGS="$PYTEST_ARGS -m smoke"
+            MARKER="smoke"
             shift
             ;;
         --no-slow)
-            PYTEST_ARGS="$PYTEST_ARGS -m 'not slow'"
+            MARKER="not slow"
             shift
             ;;
         --ui)
@@ -98,8 +106,12 @@ echo "   Browser: $BROWSER"
 echo "   Mode: $([ -z "$HEADED" ] && echo "headless" || echo "headed")"
 echo ""
 
-# Run tests
-pytest $TEST_PATH $PYTEST_ARGS $HEADED --browser $BROWSER
+# Run tests - build command properly to handle marker with spaces
+if [ -n "$MARKER" ]; then
+    pytest "$TEST_PATH" $PYTEST_ARGS -m "$MARKER" $HEADED --browser "$BROWSER"
+else
+    pytest "$TEST_PATH" $PYTEST_ARGS $HEADED --browser "$BROWSER"
+fi
 
 echo ""
 echo "✅ Tests completed!"

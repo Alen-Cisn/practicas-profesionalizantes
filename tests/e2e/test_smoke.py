@@ -18,7 +18,7 @@ class TestSmokeTests:
     def test_app_is_accessible(self, page: Page):
         """Verify the app loads and is accessible"""
         # Main header should be visible
-        expect(page.locator("text=Historical Term Analyzer")).to_be_visible()
+        expect(page.locator("text=🔍 Historical Term Analyzer")).to_be_visible()
         
         # Subtitle should be visible
         expect(page.locator("text=Análisis de términos")).to_be_visible()
@@ -33,8 +33,8 @@ class TestSmokeTests:
         expect(page.locator('label:has-text("Año fin")')).to_be_visible()
         
         # Start button
-        page.locator('button:has-text("Iniciar Análisis")').scroll_into_view_if_needed()
-        expect(page.locator('button:has-text("Iniciar Análisis")')).to_be_visible()
+        page.locator('button:has-text("▶️ Ejecutar Análisis")').scroll_into_view_if_needed()
+        expect(page.locator('button:has-text("▶️ Ejecutar Análisis")')).to_be_visible()
         
         take_screenshot(page, "smoke_test_ui")
     

@@ -719,7 +719,7 @@ class TextProcessor:
     STOP_WORDS = {
         # Artículos, preposiciones y conjunciones básicas
         'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 
-        'cnn', 'nyt', 'york'
+        'cnn', 'nyt', 'york', 'bbc', 'reuters', 'bloomberg', 'guardian', 'time',
         'he', 'in', 'is', 'it', 'its', 'of', 'on', 'that', 'the', 'to', 'was',
         'will', 'with', 'this', 'but', 'they', 'have', 'had', 'what', 'said', 
         'each', 'which', 'do', 'how', 'their', 'if', 'up', 'out', 'many',

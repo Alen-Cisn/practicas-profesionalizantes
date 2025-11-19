@@ -39,8 +39,8 @@ class TestAnalysisWorkflow:
         take_screenshot(page, "before_quick_analysis")
         
         # Start analysis
-        page.locator('button:has-text("Iniciar Análisis")').scroll_into_view_if_needed()
-        click_streamlit_button(page, "Iniciar Análisis")
+        page.locator('button:has-text("▶️ Ejecutar Análisis")').scroll_into_view_if_needed()
+        click_streamlit_button(page, "▶️ Ejecutar Análisis")
         
         # Wait for analysis to complete (with generous timeout)
         try:
@@ -89,7 +89,7 @@ class TestAnalysisWorkflow:
         page.wait_for_timeout(500)
         
         # Verify slider is functional
-        slider = page.locator('label:has-text("Máximo de páginas web") + div input[type="range"]')
+        slider = page.locator('input[type="range"][aria-label="Máximo de páginas web"]')
         expect(slider).to_be_visible()
     
     def test_rate_limit_slider(self, page: Page):
@@ -99,19 +99,23 @@ class TestAnalysisWorkflow:
         page.wait_for_timeout(500)
         
         # Verify slider exists and is interactive
-        slider = page.locator('label:has-text("Delay entre requests (segundos)") + div input[type="range"]')
+        slider = page.locator('input[type="range"][aria-label="Delay entre requests (segundos)"]')
         expect(slider).to_be_visible()
     
     def test_parallel_processing_checkbox(self, page: Page):
         """Test the parallel processing checkbox"""
-        # Find and toggle the checkbox
-        checkbox = page.locator('label:has-text("Procesamiento paralelo") input[type="checkbox"]')
+        # Find the checkbox using aria-label
+        checkbox = page.locator('input[type="checkbox"][aria-label="Procesamiento paralelo"]')
+        
+        # Wait for it to be available
+        checkbox.wait_for(state="attached", timeout=5000)
         
         # Get initial state
         is_checked = checkbox.is_checked()
         
-        # Toggle it
-        checkbox.click()
+        # Click the parent label for better reliability with Streamlit
+        checkbox_label = page.locator('label:has-text("Procesamiento paralelo")').first
+        checkbox_label.click(force=True)
         page.wait_for_timeout(300)
         
         # Verify it toggled
@@ -254,8 +258,8 @@ class TestLogFunctionality:
         move_streamlit_slider(page, "Máximo de páginas web", 50)
         
         # Start analysis
-        page.locator('button:has-text("Iniciar Análisis")').scroll_into_view_if_needed()
-        click_streamlit_button(page, "Iniciar Análisis")
+        page.locator('button:has-text("▶️ Ejecutar Análisis")').scroll_into_view_if_needed()
+        click_streamlit_button(page, "▶️ Ejecutar Análisis")
         
         # Wait a bit for log entries to appear
         page.wait_for_timeout(2000)

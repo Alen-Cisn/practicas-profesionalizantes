@@ -57,7 +57,7 @@ class TestExampleFeature:
         Demonstrates button interaction and checking results.
         """
         # Find and click a button
-        button = page.locator('button:has-text("Iniciar Análisis")')
+        button = page.locator('button:has-text("▶️ Ejecutar Análisis")')
         button.scroll_into_view_if_needed()
         
         # Verify button is clickable
@@ -76,7 +76,7 @@ class TestExampleFeature:
         basic functionality. Run with: pytest -m smoke
         """
         # Quick checks only
-        expect(page.locator("text=Historical Term Analyzer")).to_be_visible()
+        expect(page.locator("text=🔍 Historical Term Analyzer")).to_be_visible()
         expect(page.locator("text=⚙️ Configuración")).to_be_visible()
     
     @pytest.mark.slow
