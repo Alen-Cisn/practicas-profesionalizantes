@@ -88,8 +88,8 @@ class TestAnalysisWorkflow:
         move_streamlit_slider(page, "Máximo de páginas web", 500)
         page.wait_for_timeout(500)
         
-        # Verify slider is functional
-        slider = page.locator('input[type="range"][aria-label="Máximo de páginas web"]')
+        # Verify slider is functional (Streamlit 1.50.0 uses div with role="slider")
+        slider = page.locator('div[role="slider"][aria-label="Máximo de páginas web"]')
         expect(slider).to_be_visible()
     
     def test_rate_limit_slider(self, page: Page):
@@ -98,8 +98,8 @@ class TestAnalysisWorkflow:
         move_streamlit_slider(page, "Delay entre requests (segundos)", 2.0)
         page.wait_for_timeout(500)
         
-        # Verify slider exists and is interactive
-        slider = page.locator('input[type="range"][aria-label="Delay entre requests (segundos)"]')
+        # Verify slider exists and is interactive (Streamlit 1.50.0 uses div with role="slider")
+        slider = page.locator('div[role="slider"][aria-label="Delay entre requests (segundos)"]')
         expect(slider).to_be_visible()
     
     def test_parallel_processing_checkbox(self, page: Page):

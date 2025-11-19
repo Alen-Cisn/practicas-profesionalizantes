@@ -220,23 +220,61 @@ def move_streamlit_slider(page: Page, label: str, value: int):
         page: Playwright page object
         label: The label of the slider
         value: The value to set
+    
+    Note:
+        Streamlit 1.50.0+ uses div[role="slider"] instead of input[type="range"]
     """
-    # Find the slider using aria-label attribute (Streamlit sets this)
-    slider_locator = page.locator(f'input[type="range"][aria-label="{label}"]')
+    # Streamlit sliders in sidebar use div with role="slider" and aria-label
+    # Scope to sidebar first
+    sidebar = page.locator('[data-testid="stSidebar"]')
     
-    # Wait for slider to be available
-    slider_locator.wait_for(state="visible", timeout=5000)
+    # Find the slider element by role and aria-label
+    slider_element = sidebar.locator(f'div[role="slider"][aria-label="{label}"]').first
     
-    # Set the value using the locator's evaluate method
-    slider_locator.evaluate(
-        """(element, value) => {
-            element.value = value;
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-        }""",
-        value
-    )
-    page.wait_for_timeout(300)
+    try:
+        slider_element.wait_for(state="visible", timeout=5000)
+        
+        # Get the slider's value range (can be int or float)
+        min_value = float(slider_element.get_attribute('aria-valuemin'))
+        max_value = float(slider_element.get_attribute('aria-valuemax'))
+        
+        # Calculate the percentage position for the value
+        # The slider uses transform: translate() to position the thumb
+        value_range = max_value - min_value
+        value_percent = (value - min_value) / value_range
+        
+        # Get the slider track to calculate pixel position
+        # The track is the parent's parent element
+        slider_track = slider_element.locator('xpath=../..').first
+        track_width = slider_track.evaluate("el => el.getBoundingClientRect().width")
+        
+        # Calculate target position in pixels
+        target_x = track_width * value_percent
+        
+        # Drag the slider to the target position
+        # Get current slider thumb position
+        slider_box = slider_element.bounding_box()
+        if slider_box:
+            # Start from center of thumb
+            start_x = slider_box['x'] + slider_box['width'] / 2
+            start_y = slider_box['y'] + slider_box['height'] / 2
+            
+            # Calculate the track's left position
+            track_box = slider_track.bounding_box()
+            if track_box:
+                # Target position relative to track
+                target_absolute_x = track_box['x'] + target_x
+                
+                # Perform the drag
+                page.mouse.move(start_x, start_y)
+                page.mouse.down()
+                page.mouse.move(target_absolute_x, start_y, steps=10)
+                page.mouse.up()
+        
+    except Exception as e:
+        raise Exception(f"Could not locate or interact with slider '{label}' in sidebar. Error: {e}")
+    
+    page.wait_for_timeout(500)
 
 
 def wait_for_analysis_complete(page: Page, timeout: int = 120000):

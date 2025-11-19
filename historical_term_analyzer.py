@@ -222,7 +222,7 @@ class InternetArchiveClient:
         years = list(range(start_year, end_year + 1))
         docs_per_year = max(5, max_per_domain // len(years))
         
-        logger.info(f"Buscando en {len(years)} años, ~{docs_per_year} docs por año")
+        logger.info(f"Buscando en {len(years)} años, {docs_per_year} docs por año")
         
         for year in years:
             try:
@@ -232,13 +232,12 @@ class InternetArchiveClient:
                     'from': f'{year}0101',
                     'to': f'{year}1231',
                     'output': 'json',
-                    # 'fl': 'timestamp,original',  # Solo campos esenciales
-                    # 'limit': docs_per_year,
-                    # 'filter': 'statuscode:200'
+                    'limit': docs_per_year,
+                    'filter': 'statuscode:200'
                 }
                 
                 logger.debug(f"Buscando {domain} en {year}...")
-                response = self._make_request(self.CDX_API, params, limit=docs_per_year, timeout=90)
+                response = self._make_request(self.CDX_API, params, timeout=90)
 
                 if response:
                     try:
@@ -304,11 +303,6 @@ class InternetArchiveClient:
                 
                 # Rate limiting entre años - más corto
                 time.sleep(self.rate_limit_delay * 0.3)
-                
-                # Si ya tenemos suficientes documentos, parar
-                if len(all_documents) >= max_per_domain:
-                    logger.info(f"Alcanzado límite de {max_per_domain} documentos para {domain}")
-                    break
                     
             except Exception as e:
                 logger.warning(f"Error buscando año {year} en {domain}: {e}")
